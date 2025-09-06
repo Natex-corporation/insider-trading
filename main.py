@@ -20,8 +20,6 @@ SECRET_KEY = "9xnzc0fSSfduish5ocaHIYkOpaBapZChTSX2AqRf"
 BASE_URL = "https://paper-api.alpaca.markets"
 
 # --- State Management & Parameters ---
-TRADE_HISTORY_CSV = 'trade_history.csv'
-SEEN_TRADES_LOG = 'seen_insider_trades.log'
 TRADE_CAPITAL_CZK = 250.0
 TAKE_PROFIT_PERCENT = 10.0
 CHECK_INTERVAL_MINUTES = 15
@@ -138,20 +136,6 @@ def fetch_insider_trades() -> pd.DataFrame:
 # 2. Live Trading Logic and Persistent Memory
 # --------------------------------------------------
 
-def load_seen_trade_ids() -> set:
-    if not os.path.exists(SEEN_TRADES_LOG): return set()
-    with open(SEEN_TRADES_LOG, 'r') as f: return {line.strip() for line in f}
-
-def log_trades_as_seen(new_trade_ids: list):
-    with open(SEEN_TRADES_LOG, 'a') as f:
-        for trade_id in new_trade_ids: f.write(f"{trade_id}\n")
-    logging.info(f"Logged {len(new_trade_ids)} new trades to {SEEN_TRADES_LOG}")
-
-def load_trade_history() -> pd.DataFrame:
-    if not os.path.exists(TRADE_HISTORY_CSV): return pd.DataFrame(columns=['trade_id'])
-    try: return pd.read_csv(TRADE_HISTORY_CSV)
-    except pd.errors.EmptyDataError: return pd.DataFrame(columns=['trade_id'])
-
 def get_current_positions(api: REST) -> Dict[str, str]:
     """Return a mapping of ticker symbol to position side."""
     try:
@@ -164,25 +148,6 @@ def get_current_positions(api: REST) -> Dict[str, str]:
     except Exception as e:
         logging.error(f"Could not list open positions: {e}")
         return {}
-
-def log_trade_to_history(
-    trade_details: pd.Series,
-    order_obj,
-    entry_price: float,
-    tp_price: float,
-    sl_price: Optional[float] = None,
-):
-    record = {
-        'trade_id': trade_details['trade_id'], 'timestamp_utc': datetime.datetime.utcnow().isoformat(),
-        'ticker': order_obj.symbol, 'side': order_obj.side, 'order_qty': order_obj.qty,
-        'insider_date': trade_details['insider_date'], 'insider_name': trade_details['insider'],
-        'estimated_entry_price': entry_price, 'take_profit_price': tp_price, 'stop_loss_price': sl_price,
-        'alpaca_order_id': order_obj.id, 'status': order_obj.status, 'exit_reason': None
-    }
-    file_exists = os.path.exists(TRADE_HISTORY_CSV)
-    df = pd.DataFrame([record])
-    df.to_csv(TRADE_HISTORY_CSV, mode='a', header=not file_exists, index=False)
-    logging.info(f"Successfully logged trade execution {record['trade_id']} to {TRADE_HISTORY_CSV}")
 
 def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: float) -> bool:
     """
@@ -217,7 +182,6 @@ def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: 
     try:
         # --- PLAN A: Submit the order as calculated ---
         order = api.submit_order(symbol=symbol, qty=qty, side=side, type='market', time_in_force='day')
-        log_trade_to_history(trade_details, order, latest_price, tp_price, sl_price)
         return True
     except APIError as e:
         # --- PLAN B: If it's a "not fractionable" error on a buy, retry with whole shares ---
@@ -231,7 +195,6 @@ def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: 
                 # Retry the order with the new integer quantity
                 logging.info(f"Submitting {side} MARKET order for {whole_qty} (whole) shares of {symbol}.")
                 order = api.submit_order(symbol=symbol, qty=whole_qty, side=side, type='market', time_in_force='day')
-                log_trade_to_history(trade_details, order, latest_price, tp_price, sl_price)
                 return True
             except Exception as retry_e:
                 logging.error(f"Retry attempt for {symbol} also failed: {retry_e}")
@@ -244,26 +207,31 @@ def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: 
         logging.error(f"An unknown error occurred placing order for {symbol}: {e}")
         return False
 
-def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame):
-    # This function is from your script and remains unchanged.
+def check_and_manage_positions(api: REST):
+    """Close positions once their take-profit level is reached."""
     logging.info("Checking open positions for exit signals...")
-    try: positions = api.list_positions()
-    except Exception as e: logging.error(f"Could not list open positions: {e}"); return
-    if not positions: logging.info("No open positions to manage."); return
+    try:
+        positions = api.list_positions()
+    except Exception as e:
+        logging.error(f"Could not list open positions: {e}")
+        return
+    if not positions:
+        logging.info("No open positions to manage.")
+        return
     for pos in positions:
         try:
             current_price = api.get_latest_trade(pos.symbol).price
-            trade_record = trade_history_df[trade_history_df['ticker'] == pos.symbol].tail(1)
-            if trade_record.empty:
-                continue
-            tp_price = trade_record['take_profit_price'].iloc[0]
+            entry = float(pos.avg_entry_price)
+            tp_price = (
+                entry * (1 + TAKE_PROFIT_PERCENT / 100)
+                if pos.side == 'long'
+                else entry * (1 - TAKE_PROFIT_PERCENT / 100)
+            )
             exit_reason = None
-            if pos.side == 'long':
-                if current_price >= tp_price:
-                    exit_reason = f"take profit at ${tp_price}"
-            elif pos.side == 'short':
-                if current_price <= tp_price:
-                    exit_reason = f"take profit at ${tp_price}"
+            if pos.side == 'long' and current_price >= tp_price:
+                exit_reason = f"take profit at ${tp_price:.2f}"
+            elif pos.side == 'short' and current_price <= tp_price:
+                exit_reason = f"take profit at ${tp_price:.2f}"
             if exit_reason:
                 qty_avail = float(getattr(pos, "qty_available", pos.qty))
                 if qty_avail <= 0:
@@ -273,7 +241,8 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame):
                     continue
                 logging.info(f"Closing {pos.symbol} due to {exit_reason}.")
                 api.close_position(pos.symbol)
-        except Exception as e: logging.error(f"Error managing position for {pos.symbol}: {e}")
+        except Exception as e:
+            logging.error(f"Error managing position for {pos.symbol}: {e}")
 
 # --------------------------------------------------
 # 3. Main Execution Loop
@@ -288,41 +257,32 @@ if __name__ == '__main__':
             capital_per_trade_usd = TRADE_CAPITAL_CZK * usd_per_czk
             logging.info(f"{TRADE_CAPITAL_CZK} CZK is approx ${capital_per_trade_usd:.2f} USD.")
 
-            seen_trade_ids = load_seen_trade_ids()
             positions = get_current_positions(api)
-            logging.info(f"Loaded {len(seen_trade_ids)} seen trade IDs. Holding {len(positions)} positions: {list(positions.keys())}")
+            logging.info(f"Holding {len(positions)} positions: {list(positions.keys())}")
 
             latest_trades_df = fetch_insider_trades()
             if not latest_trades_df.empty:
-                new_unseen_trades = latest_trades_df[~latest_trades_df['trade_id'].isin(seen_trade_ids)]
-                if not new_unseen_trades.empty:
-                    logging.info(f"Found {len(new_unseen_trades)} new, unseen insider trades.")
-                    log_trades_as_seen(new_unseen_trades['trade_id'].tolist())
-                    for _, trade in new_unseen_trades.iterrows():
-                        existing_side = positions.get(trade['ticker'])
-                        desired_side = 'long' if trade['direction'] == 'buy' else 'short'
-                        if existing_side == desired_side:
-                            logging.info(f"Skipping trade for {trade['ticker']}: {existing_side} position already open.")
+                for _, trade in latest_trades_df.iterrows():
+                    existing_side = positions.get(trade['ticker'])
+                    desired_side = 'long' if trade['direction'] == 'buy' else 'short'
+                    if existing_side == desired_side:
+                        logging.info(f"Skipping trade for {trade['ticker']}: {existing_side} position already open.")
+                        continue
+                    if existing_side and existing_side != desired_side:
+                        logging.info(f"Closing existing {existing_side} position in {trade['ticker']} before opening {desired_side}.")
+                        try:
+                            api.close_position(trade['ticker'])
+                            positions.pop(trade['ticker'], None)
+                        except Exception as e:
+                            logging.error(f"Failed to close position for {trade['ticker']}: {e}")
                             continue
-                        if existing_side and existing_side != desired_side:
-                            logging.info(f"Closing existing {existing_side} position in {trade['ticker']} before opening {desired_side}.")
-                            try:
-                                api.close_position(trade['ticker'])
-                                positions.pop(trade['ticker'], None)
-                            except Exception as e:
-                                logging.error(f"Failed to close position for {trade['ticker']}: {e}")
-                                continue
-                        success = place_simple_market_order(api, trade, capital_per_trade_usd)
-                        if success:
-                            positions[trade['ticker']] = desired_side
-                            logging.info(f"Added {trade['ticker']} to in-memory positions to prevent duplicate trades this cycle.")
-                            time.sleep(2)
-                else:
-                    logging.info("No new, unseen trades found since last check.")
-            
-            trade_history_df = load_trade_history()
-            if not trade_history_df.empty:
-                check_and_manage_positions(api, trade_history_df)
+                    success = place_simple_market_order(api, trade, capital_per_trade_usd)
+                    if success:
+                        positions[trade['ticker']] = desired_side
+                        logging.info(f"Added {trade['ticker']} to in-memory positions to prevent duplicate trades this cycle.")
+                        time.sleep(2)
+
+            check_and_manage_positions(api)
         
         except Exception as e:
             logging.critical(f"A critical error occurred in the main loop: {e}")

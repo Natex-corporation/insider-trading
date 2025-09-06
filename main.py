@@ -120,7 +120,12 @@ def load_trade_history() -> pd.DataFrame:
 def get_current_positions(api: REST) -> Dict[str, str]:
     """Return a mapping of ticker symbol to position side."""
     try:
-        return {p.symbol: p.side for p in api.list_positions()}
+        positions = api.list_positions()
+        return {
+            p.symbol: p.side
+            for p in positions
+            if float(getattr(p, "qty_available", p.qty)) > 0
+        }
     except Exception as e:
         logging.error(f"Could not list open positions: {e}")
         return {}
@@ -225,6 +230,12 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame):
                 if current_price <= tp_price:
                     exit_reason = f"take profit at ${tp_price}"
             if exit_reason:
+                qty_avail = float(getattr(pos, "qty_available", pos.qty))
+                if qty_avail <= 0:
+                    logging.warning(
+                        f"Skipping close for {pos.symbol}: no available quantity (qty_available={qty_avail})."
+                    )
+                    continue
                 logging.info(f"Closing {pos.symbol} due to {exit_reason}.")
                 api.close_position(pos.symbol)
         except Exception as e: logging.error(f"Error managing position for {pos.symbol}: {e}")

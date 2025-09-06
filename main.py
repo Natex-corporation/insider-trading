@@ -27,15 +27,50 @@ TAKE_PROFIT_PERCENT = 10.0
 CHECK_INTERVAL_MINUTES = 15
 
 
-def get_usd_per_czk() -> Optional[float]:
-    # This function is from your script and remains unchanged.
-    try:
-        url = "https://api.exchangerate-api.com/v4/latest/CZK"
-        response = requests.get(url, timeout=10); response.raise_for_status()
-        data = response.json(); rate = data['rates']['USD']
-        logging.info(f"Fetched CZK to USD exchange rate: {rate}"); return float(rate)
-    except Exception as e:
-        logging.error(f"Could not fetch CZK to USD exchange rate: {e}"); return None
+RATE_CACHE_FILE = "czk_usd_rate.cache"
+
+def get_usd_per_czk() -> float:
+    """Return the CZK→USD exchange rate.
+
+    Tries a primary API, then a backup provider. If both fail, it falls back to
+    a cached value on disk or a conservative default so the bot can continue
+    operating even without network access.
+    """
+    urls = [
+        "https://api.exchangerate-api.com/v4/latest/CZK",
+        "https://open.er-api.com/v6/latest/CZK",
+    ]
+    rate: Optional[float] = None
+    for url in urls:
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            rate = float(data["rates"]["USD"])
+            logging.info(f"Fetched CZK to USD exchange rate: {rate}")
+            break
+        except Exception as e:
+            logging.warning(f"Exchange rate fetch failed from {url}: {e}")
+
+    if rate is None:
+        try:
+            with open(RATE_CACHE_FILE, "r") as f:
+                rate = float(f.read().strip())
+            logging.warning(f"Using cached CZK to USD exchange rate: {rate}")
+        except Exception:
+            rate = 0.045  # conservative fallback
+            logging.warning(
+                f"Using fallback CZK to USD exchange rate: {rate} (no cache available)"
+            )
+
+    else:
+        try:
+            with open(RATE_CACHE_FILE, "w") as f:
+                f.write(str(rate))
+        except Exception as e:
+            logging.debug(f"Could not write rate cache: {e}")
+
+    return rate
 
 def parse_finviz_date(raw: str) -> Optional[datetime.date]:
     # This function is from your script and remains unchanged.
@@ -250,8 +285,6 @@ if __name__ == '__main__':
     while True:
         try:
             usd_per_czk = get_usd_per_czk()
-            if usd_per_czk is None:
-                logging.error("Halting check: could not get exchange rate."); time.sleep(60 * 5); continue
             capital_per_trade_usd = TRADE_CAPITAL_CZK * usd_per_czk
             logging.info(f"{TRADE_CAPITAL_CZK} CZK is approx ${capital_per_trade_usd:.2f} USD.")
 

@@ -7,7 +7,7 @@ import os
 import time
 import json
 import re
-from typing import Optional
+from typing import Optional, Dict
 from alpaca_trade_api.rest import REST, APIError
 
 # --- Basic Setup ---
@@ -116,6 +116,14 @@ def load_trade_history() -> pd.DataFrame:
     if not os.path.exists(TRADE_HISTORY_CSV): return pd.DataFrame(columns=['trade_id'])
     try: return pd.read_csv(TRADE_HISTORY_CSV)
     except pd.errors.EmptyDataError: return pd.DataFrame(columns=['trade_id'])
+
+def get_current_positions(api: REST) -> Dict[str, str]:
+    """Return a mapping of ticker symbol to position side."""
+    try:
+        return {p.symbol: p.side for p in api.list_positions()}
+    except Exception as e:
+        logging.error(f"Could not list open positions: {e}")
+        return {}
 
 def log_trade_to_history(
     trade_details: pd.Series,
@@ -237,8 +245,8 @@ if __name__ == '__main__':
             logging.info(f"{TRADE_CAPITAL_CZK} CZK is approx ${capital_per_trade_usd:.2f} USD.")
 
             seen_trade_ids = load_seen_trade_ids()
-            open_positions = {p.symbol for p in api.list_positions()}
-            logging.info(f"Loaded {len(seen_trade_ids)} seen trade IDs. Holding {len(open_positions)} positions: {list(open_positions)}")
+            positions = get_current_positions(api)
+            logging.info(f"Loaded {len(seen_trade_ids)} seen trade IDs. Holding {len(positions)} positions: {list(positions.keys())}")
 
             latest_trades_df = fetch_insider_trades()
             if not latest_trades_df.empty:
@@ -247,12 +255,22 @@ if __name__ == '__main__':
                     logging.info(f"Found {len(new_unseen_trades)} new, unseen insider trades.")
                     log_trades_as_seen(new_unseen_trades['trade_id'].tolist())
                     for _, trade in new_unseen_trades.iterrows():
-                        if trade['ticker'] in open_positions:
-                            logging.info(f"Skipping trade for {trade['ticker']}: position already open.")
+                        existing_side = positions.get(trade['ticker'])
+                        desired_side = 'long' if trade['direction'] == 'buy' else 'short'
+                        if existing_side == desired_side:
+                            logging.info(f"Skipping trade for {trade['ticker']}: {existing_side} position already open.")
                             continue
+                        if existing_side and existing_side != desired_side:
+                            logging.info(f"Closing existing {existing_side} position in {trade['ticker']} before opening {desired_side}.")
+                            try:
+                                api.close_position(trade['ticker'])
+                                positions.pop(trade['ticker'], None)
+                            except Exception as e:
+                                logging.error(f"Failed to close position for {trade['ticker']}: {e}")
+                                continue
                         success = place_simple_market_order(api, trade, capital_per_trade_usd)
                         if success:
-                            open_positions.add(trade['ticker'])
+                            positions[trade['ticker']] = desired_side
                             logging.info(f"Added {trade['ticker']} to in-memory positions to prevent duplicate trades this cycle.")
                             time.sleep(2)
                 else:

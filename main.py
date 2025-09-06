@@ -7,6 +7,7 @@ import os
 import time
 import json
 import re
+from typing import Optional
 from alpaca_trade_api.rest import REST, APIError
 
 # --- Basic Setup ---
@@ -26,7 +27,7 @@ TAKE_PROFIT_PERCENT = 10.0
 CHECK_INTERVAL_MINUTES = 15
 
 
-def get_usd_per_czk() -> float | None:
+def get_usd_per_czk() -> Optional[float]:
     # This function is from your script and remains unchanged.
     try:
         url = "https://api.exchangerate-api.com/v4/latest/CZK"
@@ -36,7 +37,7 @@ def get_usd_per_czk() -> float | None:
     except Exception as e:
         logging.error(f"Could not fetch CZK to USD exchange rate: {e}"); return None
 
-def parse_finviz_date(raw: str) -> datetime.date | None:
+def parse_finviz_date(raw: str) -> Optional[datetime.date]:
     # This function is from your script and remains unchanged.
     try: return datetime.datetime.strptime(raw.strip(), "%b %d '%y").date()
     except ValueError:
@@ -45,7 +46,7 @@ def parse_finviz_date(raw: str) -> datetime.date | None:
             return dt.replace(year=datetime.date.today().year)
         except Exception: return None
 
-def infer_direction(txn: str) -> str | None:
+def infer_direction(txn: str) -> Optional[str]:
     # This function is from your script and remains unchanged.
     lower = txn.lower()
     if 'buy' in lower: return 'buy'
@@ -121,7 +122,7 @@ def log_trade_to_history(
     order_obj,
     entry_price: float,
     tp_price: float,
-    sl_price: float | None = None,
+    sl_price: Optional[float] = None,
 ):
     record = {
         'trade_id': trade_details['trade_id'], 'timestamp_utc': datetime.datetime.utcnow().isoformat(),

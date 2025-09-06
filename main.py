@@ -22,9 +22,7 @@ BASE_URL = "https://paper-api.alpaca.markets"
 TRADE_HISTORY_CSV = 'trade_history.csv'
 SEEN_TRADES_LOG = 'seen_insider_trades.log'
 TRADE_CAPITAL_CZK = 250.0
-POSITION_HOLD_LIMIT_DAYS = 30
 TAKE_PROFIT_PERCENT = 10.0
-STOP_LOSS_PERCENT = 10.0
 CHECK_INTERVAL_MINUTES = 15
 
 
@@ -118,7 +116,13 @@ def load_trade_history() -> pd.DataFrame:
     try: return pd.read_csv(TRADE_HISTORY_CSV)
     except pd.errors.EmptyDataError: return pd.DataFrame(columns=['trade_id'])
 
-def log_trade_to_history(trade_details: pd.Series, order_obj, entry_price: float, tp_price: float, sl_price: float):
+def log_trade_to_history(
+    trade_details: pd.Series,
+    order_obj,
+    entry_price: float,
+    tp_price: float,
+    sl_price: float | None = None,
+):
     record = {
         'trade_id': trade_details['trade_id'], 'timestamp_utc': datetime.datetime.utcnow().isoformat(),
         'ticker': order_obj.symbol, 'side': order_obj.side, 'order_qty': order_obj.qty,
@@ -156,10 +160,9 @@ def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: 
 
     if side == 'buy':
         tp_price = round(latest_price * (1 + TAKE_PROFIT_PERCENT / 100), 2)
-        sl_price = round(latest_price * (1 - STOP_LOSS_PERCENT / 100), 2)
     else:
         tp_price = round(latest_price * (1 - TAKE_PROFIT_PERCENT / 100), 2)
-        sl_price = round(latest_price * (1 + STOP_LOSS_PERCENT / 100), 2)
+    sl_price = None
     
     logging.info(f"Submitting {side} MARKET order for {qty} shares of {symbol}.")
     try:
@@ -202,18 +205,16 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame):
         try:
             current_price = api.get_latest_trade(pos.symbol).price
             trade_record = trade_history_df[trade_history_df['ticker'] == pos.symbol].tail(1)
-            if trade_record.empty: continue
-            tp_price = trade_record['take_profit_price'].iloc[0]; sl_price = trade_record['stop_loss_price'].iloc[0]
-            entry_time = datetime.datetime.fromisoformat(trade_record['timestamp_utc'].iloc[0])
-            days_held = (datetime.datetime.utcnow() - entry_time).days
+            if trade_record.empty:
+                continue
+            tp_price = trade_record['take_profit_price'].iloc[0]
             exit_reason = None
             if pos.side == 'long':
-                if current_price >= tp_price: exit_reason = f"take profit at ${tp_price}"
-                elif current_price <= sl_price: exit_reason = f"stop loss at ${sl_price}"
+                if current_price >= tp_price:
+                    exit_reason = f"take profit at ${tp_price}"
             elif pos.side == 'short':
-                if current_price <= tp_price: exit_reason = f"take profit at ${tp_price}"
-                elif current_price >= sl_price: exit_reason = f"stop loss at ${sl_price}"
-            if days_held > POSITION_HOLD_LIMIT_DAYS: exit_reason = f"time limit of {POSITION_HOLD_LIMIT_DAYS} days"
+                if current_price <= tp_price:
+                    exit_reason = f"take profit at ${tp_price}"
             if exit_reason:
                 logging.info(f"Closing {pos.symbol} due to {exit_reason}.")
                 api.close_position(pos.symbol)

@@ -83,7 +83,8 @@ TRADE_CAPITAL_CZK = 250.0
 TAKE_PROFIT_PERCENT = 10.0
 INSIDER_SCAN_INTERVAL_MINUTES = 15
 POSITION_CHECK_INTERVAL_MINUTES = 5
-POLL_INTERVAL_SECONDS = 60
+MARKET_OPEN_POLL_SECONDS = 60
+MARKET_CLOSED_POLL_SECONDS = INSIDER_SCAN_INTERVAL_MINUTES * 60
 
 
 def get_usd_per_czk() -> float | None:
@@ -645,6 +646,7 @@ if __name__ == '__main__':
         cycle_start = datetime.datetime.utcnow()
         pending_orders = load_pending_orders()
         pending_modified = False
+        is_market_open = False
 
         try:
             try:
@@ -736,6 +738,12 @@ if __name__ == '__main__':
         if pending_modified:
             save_pending_orders(pending_orders)
 
-        log.info(f"Cycle complete. Sleeping for {POLL_INTERVAL_SECONDS} seconds.")
-        heartbeat("sleep", note=f"{POLL_INTERVAL_SECONDS}s")
-        time.sleep(POLL_INTERVAL_SECONDS)
+        sleep_seconds = (
+            MARKET_OPEN_POLL_SECONDS if is_market_open else MARKET_CLOSED_POLL_SECONDS
+        )
+        market_state = "open" if is_market_open else "closed"
+        log.info(
+            f"Cycle complete. Sleeping for {sleep_seconds} seconds (market {market_state})."
+        )
+        heartbeat("sleep", note=f"{sleep_seconds}s_{market_state}")
+        time.sleep(sleep_seconds)

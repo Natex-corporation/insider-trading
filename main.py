@@ -21,9 +21,13 @@ BASE_URL = "https://paper-api.alpaca.markets"
 # --- State Management & Parameters ---
 TRADE_HISTORY_CSV = 'trade_history.csv'
 SEEN_TRADES_LOG = 'seen_insider_trades.log'
+PENDING_ORDERS_JSON = 'pending_orders.json'
+
 TRADE_CAPITAL_CZK = 250.0
 TAKE_PROFIT_PERCENT = 10.0
-CHECK_INTERVAL_MINUTES = 15
+INSIDER_SCAN_INTERVAL_MINUTES = 15
+POSITION_CHECK_INTERVAL_MINUTES = 5
+POLL_INTERVAL_SECONDS = 60
 
 
 def get_usd_per_czk() -> float | None:
@@ -117,31 +121,297 @@ def load_trade_history() -> pd.DataFrame:
     except pd.errors.EmptyDataError: return pd.DataFrame(columns=['trade_id'])
 
 def log_trade_to_history(
-    trade_details: pd.Series,
+    trade_details,
     order_obj,
     entry_price: float,
     tp_price: float,
     sl_price: float | None = None,
 ):
+    if isinstance(trade_details, pd.Series):
+        trade_info = trade_details.to_dict()
+    else:
+        trade_info = dict(trade_details)
+
+    insider_date = trade_info.get('insider_date')
+    if isinstance(insider_date, (datetime.date, datetime.datetime)):
+        insider_date_str = insider_date.isoformat()
+    elif insider_date is not None:
+        insider_date_str = str(insider_date)
+    else:
+        insider_date_str = None
+
     record = {
-        'trade_id': trade_details['trade_id'], 'timestamp_utc': datetime.datetime.utcnow().isoformat(),
+        'trade_id': trade_info.get('trade_id'), 'timestamp_utc': datetime.datetime.utcnow().isoformat(),
         'ticker': order_obj.symbol, 'side': order_obj.side, 'order_qty': order_obj.qty,
-        'insider_date': trade_details['insider_date'], 'insider_name': trade_details['insider'],
+        'insider_date': insider_date_str, 'insider_name': trade_info.get('insider'),
         'estimated_entry_price': entry_price, 'take_profit_price': tp_price, 'stop_loss_price': sl_price,
-        'alpaca_order_id': order_obj.id, 'status': order_obj.status, 'exit_reason': None
+        'alpaca_order_id': order_obj.id, 'status': order_obj.status, 'exit_reason': None,
+        'exit_timestamp_utc': None
     }
     file_exists = os.path.exists(TRADE_HISTORY_CSV)
     df = pd.DataFrame([record])
     df.to_csv(TRADE_HISTORY_CSV, mode='a', header=not file_exists, index=False)
     logging.info(f"Successfully logged trade execution {record['trade_id']} to {TRADE_HISTORY_CSV}")
 
-def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: float) -> bool:
+
+def update_trade_exit_in_history(symbol: str, exit_reason: str):
+    if not os.path.exists(TRADE_HISTORY_CSV):
+        return
+    try:
+        df = pd.read_csv(TRADE_HISTORY_CSV)
+    except pd.errors.EmptyDataError:
+        return
+
+    if df.empty or 'ticker' not in df.columns:
+        return
+
+    if 'exit_reason' not in df.columns:
+        df['exit_reason'] = None
+    if 'exit_timestamp_utc' not in df.columns:
+        df['exit_timestamp_utc'] = None
+
+    mask = df['ticker'] == symbol
+    if not mask.any():
+        return
+
+    idx = df[mask].index[-1]
+    df.loc[idx, 'exit_reason'] = exit_reason
+    df.loc[idx, 'exit_timestamp_utc'] = datetime.datetime.utcnow().isoformat()
+    df.to_csv(TRADE_HISTORY_CSV, index=False)
+    logging.info(f"Updated trade history for {symbol} with exit reason '{exit_reason}'.")
+
+
+def ensure_pending_structure(data: dict | None) -> dict:
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault('buy', [])
+    data.setdefault('sell', [])
+    return data
+
+
+def load_pending_orders() -> dict:
+    if not os.path.exists(PENDING_ORDERS_JSON):
+        return {'buy': [], 'sell': []}
+    try:
+        with open(PENDING_ORDERS_JSON, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logging.error(f"Could not read {PENDING_ORDERS_JSON}: {e}. Starting with empty queue.")
+        return {'buy': [], 'sell': []}
+    return ensure_pending_structure(data)
+
+
+def save_pending_orders(pending_orders: dict):
+    data = ensure_pending_structure(pending_orders)
+    with open(PENDING_ORDERS_JSON, 'w') as f:
+        json.dump(data, f, indent=2)
+    logging.info(f"Persisted pending orders queue to {PENDING_ORDERS_JSON}.")
+
+
+def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
+    pending = ensure_pending_structure(pending_orders)
+    trade_info = trade_details.to_dict() if isinstance(trade_details, pd.Series) else dict(trade_details)
+    trade_id = trade_info.get('trade_id')
+    ticker = trade_info.get('ticker')
+    if not trade_id or not ticker:
+        logging.warning("Cannot queue trade without trade_id and ticker.")
+        return False
+
+    existing_ids = {order.get('trade_id') for order in pending['buy']}
+    if trade_id in existing_ids:
+        logging.info(f"Trade {trade_id} for {ticker} is already queued for execution.")
+        return False
+
+    insider_date = trade_info.get('insider_date')
+    if isinstance(insider_date, (datetime.date, datetime.datetime)):
+        insider_date_str = insider_date.isoformat()
+    elif insider_date is not None:
+        insider_date_str = str(insider_date)
+    else:
+        insider_date_str = None
+
+    pending['buy'].append({
+        'trade_id': trade_id,
+        'ticker': ticker,
+        'direction': trade_info.get('direction', 'buy'),
+        'insider_date': insider_date_str,
+        'insider': trade_info.get('insider'),
+        'queued_at_utc': datetime.datetime.utcnow().isoformat()
+    })
+    logging.info(f"Queued buy order for {ticker} ({trade_id}) until market hours.")
+    return True
+
+
+def queue_pending_sell(pending_orders: dict, symbol: str, reason: str) -> bool:
+    if not symbol:
+        logging.warning("Cannot queue sell order without a symbol.")
+        return False
+
+    pending = ensure_pending_structure(pending_orders)
+    existing = {(order.get('symbol'), order.get('reason')) for order in pending['sell']}
+    key = (symbol, reason)
+    if key in existing:
+        logging.info(f"Sell order for {symbol} ({reason}) is already queued.")
+        return False
+
+    pending['sell'].append({
+        'symbol': symbol,
+        'reason': reason,
+        'queued_at_utc': datetime.datetime.utcnow().isoformat()
+    })
+    logging.info(f"Queued sell order for {symbol} due to {reason}.")
+    return True
+
+
+def execute_pending_orders(api: REST, pending_orders: dict) -> bool:
+    pending = ensure_pending_structure(pending_orders)
+    modified = False
+
+    sell_orders = pending.get('sell', [])
+    if sell_orders:
+        remaining_sell_orders = []
+        for order in sell_orders:
+            symbol = order.get('symbol')
+            reason = order.get('reason', 'pending sell')
+            if not symbol:
+                continue
+            try:
+                api.close_position(symbol)
+                logging.info(f"Executed queued sell for {symbol} ({reason}).")
+                update_trade_exit_in_history(symbol, reason)
+                modified = True
+            except Exception as e:
+                logging.error(f"Failed to execute queued sell for {symbol}: {e}")
+                remaining_sell_orders.append(order)
+        pending['sell'] = remaining_sell_orders
+        if len(remaining_sell_orders) != len(sell_orders):
+            modified = True
+
+    buy_orders = pending.get('buy', [])
+    if buy_orders:
+        usd_per_czk = get_usd_per_czk()
+        if usd_per_czk is None:
+            logging.error("Cannot execute queued buy orders without an exchange rate. Will retry later.")
+            return modified
+        capital_per_trade_usd = TRADE_CAPITAL_CZK * usd_per_czk
+        try:
+            open_positions = {p.symbol for p in api.list_positions()}
+        except Exception as e:
+            logging.error(f"Could not refresh open positions before executing queued buys: {e}")
+            open_positions = set()
+
+        remaining_buy_orders = []
+        for order in buy_orders:
+            trade = dict(order)
+            symbol = trade.get('ticker')
+            if not symbol:
+                logging.warning("Skipping queued buy order without a ticker symbol.")
+                continue
+            if symbol in open_positions:
+                logging.info(f"Skipping queued buy for {symbol}: position already open.")
+                modified = True
+                continue
+
+            insider_date = trade.get('insider_date')
+            if isinstance(insider_date, str):
+                try:
+                    trade['insider_date'] = datetime.date.fromisoformat(insider_date)
+                except ValueError:
+                    pass
+
+            trade.setdefault('direction', 'buy')
+            success = place_simple_market_order(api, trade, capital_per_trade_usd)
+            if success:
+                open_positions.add(symbol)
+                modified = True
+                time.sleep(2)
+            else:
+                remaining_buy_orders.append(order)
+
+        pending['buy'] = remaining_buy_orders
+        if len(remaining_buy_orders) != len(buy_orders):
+            modified = True
+
+    return modified
+
+
+def process_insider_trades(api: REST, is_market_open: bool, pending_orders: dict) -> bool:
+    pending = ensure_pending_structure(pending_orders)
+    pending_buy_ids = {order.get('trade_id') for order in pending['buy']}
+
+    try:
+        open_positions = {p.symbol for p in api.list_positions()}
+    except Exception as e:
+        logging.error(f"Could not load open positions: {e}")
+        open_positions = set()
+
+    can_trade_now = False
+    capital_per_trade_usd = None
+    if is_market_open:
+        usd_per_czk = get_usd_per_czk()
+        if usd_per_czk is None:
+            logging.error("Cannot calculate USD capital; deferring new trades until rate is available.")
+        else:
+            capital_per_trade_usd = TRADE_CAPITAL_CZK * usd_per_czk
+            can_trade_now = True
+
+    seen_trade_ids = load_seen_trade_ids()
+    latest_trades_df = fetch_insider_trades()
+    if latest_trades_df.empty:
+        logging.info("No insider trades retrieved in this scan.")
+        return False
+
+    new_unseen_trades = latest_trades_df[~latest_trades_df['trade_id'].isin(seen_trade_ids)]
+    if new_unseen_trades.empty:
+        logging.info("No new insider trades found since the last scan.")
+        return False
+
+    log_trades_as_seen(new_unseen_trades['trade_id'].tolist())
+    logging.info(f"Found {len(new_unseen_trades)} new insider trades to evaluate.")
+
+    queued_count = 0
+    for _, trade in new_unseen_trades.iterrows():
+        ticker = trade['ticker']
+        trade_id = trade['trade_id']
+        if ticker in open_positions:
+            logging.info(f"Skipping {ticker}: position already open.")
+            continue
+        if trade_id in pending_buy_ids:
+            logging.info(f"Skipping {ticker}: trade {trade_id} already queued.")
+            continue
+
+        if can_trade_now:
+            success = place_simple_market_order(api, trade, capital_per_trade_usd)
+            if success:
+                open_positions.add(ticker)
+                time.sleep(2)
+            else:
+                logging.error(f"Failed to submit order for {ticker} during market hours.")
+        else:
+            if queue_pending_trade(pending_orders, trade):
+                pending_buy_ids.add(trade_id)
+                queued_count += 1
+
+    if queued_count:
+        logging.info(f"Queued {queued_count} trades for the next market session.")
+
+    return queued_count > 0
+
+def place_simple_market_order(api: REST, trade_details, capital_usd: float) -> bool:
     """
     Places a market order.
     - Tries fractional for buys, falls back to whole shares if asset is not fractionable.
     - Uses whole shares for sells.
     """
-    symbol = trade_details['ticker']; side = trade_details['direction']
+    if isinstance(trade_details, pd.Series):
+        trade_info = trade_details.to_dict()
+    else:
+        trade_info = dict(trade_details)
+
+    symbol = trade_info.get('ticker'); side = trade_info.get('direction')
+    if not symbol or not side:
+        logging.error("Trade details missing symbol or side. Cannot submit order.")
+        return False
     try:
         latest_price = api.get_latest_trade(symbol).price
     except Exception as e:
@@ -168,7 +438,7 @@ def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: 
     try:
         # --- PLAN A: Submit the order as calculated ---
         order = api.submit_order(symbol=symbol, qty=qty, side=side, type='market', time_in_force='day')
-        log_trade_to_history(trade_details, order, latest_price, tp_price, sl_price)
+        log_trade_to_history(trade_info, order, latest_price, tp_price, sl_price)
         return True
     except APIError as e:
         # --- PLAN B: If it's a "not fractionable" error on a buy, retry with whole shares ---
@@ -182,7 +452,7 @@ def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: 
                 # Retry the order with the new integer quantity
                 logging.info(f"Submitting {side} MARKET order for {whole_qty} (whole) shares of {symbol}.")
                 order = api.submit_order(symbol=symbol, qty=whole_qty, side=side, type='market', time_in_force='day')
-                log_trade_to_history(trade_details, order, latest_price, tp_price, sl_price)
+                log_trade_to_history(trade_info, order, latest_price, tp_price, sl_price)
                 return True
             except Exception as retry_e:
                 logging.error(f"Retry attempt for {symbol} also failed: {retry_e}")
@@ -195,30 +465,57 @@ def place_simple_market_order(api: REST, trade_details: pd.Series, capital_usd: 
         logging.error(f"An unknown error occurred placing order for {symbol}: {e}")
         return False
 
-def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame):
-    # This function is from your script and remains unchanged.
+def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame, is_market_open: bool, pending_orders: dict) -> bool:
     logging.info("Checking open positions for exit signals...")
-    try: positions = api.list_positions()
-    except Exception as e: logging.error(f"Could not list open positions: {e}"); return
-    if not positions: logging.info("No open positions to manage."); return
+    try:
+        positions = api.list_positions()
+    except Exception as e:
+        logging.error(f"Could not list open positions: {e}")
+        return False
+
+    if not positions:
+        logging.info("No open positions to manage.")
+        return False
+
+    pending_modified = False
+
     for pos in positions:
         try:
             current_price = api.get_latest_trade(pos.symbol).price
             trade_record = trade_history_df[trade_history_df['ticker'] == pos.symbol].tail(1)
-            if trade_record.empty:
+            if trade_record.empty or 'take_profit_price' not in trade_record.columns:
                 continue
-            tp_price = trade_record['take_profit_price'].iloc[0]
+
+            try:
+                tp_price = float(trade_record['take_profit_price'].iloc[0])
+            except (TypeError, ValueError):
+                logging.warning(f"Invalid take profit price for {pos.symbol}; skipping exit check.")
+                continue
+
             exit_reason = None
-            if pos.side == 'long':
-                if current_price >= tp_price:
-                    exit_reason = f"take profit at ${tp_price}"
-            elif pos.side == 'short':
-                if current_price <= tp_price:
-                    exit_reason = f"take profit at ${tp_price}"
+            if pos.side == 'long' and current_price >= tp_price:
+                exit_reason = f"take profit at ${tp_price}"
+            elif pos.side == 'short' and current_price <= tp_price:
+                exit_reason = f"take profit at ${tp_price}"
+
             if exit_reason:
-                logging.info(f"Closing {pos.symbol} due to {exit_reason}.")
-                api.close_position(pos.symbol)
-        except Exception as e: logging.error(f"Error managing position for {pos.symbol}: {e}")
+                if is_market_open:
+                    try:
+                        api.close_position(pos.symbol)
+                        logging.info(f"Closed {pos.symbol} due to {exit_reason}.")
+                        update_trade_exit_in_history(pos.symbol, exit_reason)
+                        pending_modified = True
+                    except Exception as e:
+                        logging.error(f"Failed to close {pos.symbol}: {e}")
+                        if queue_pending_sell(pending_orders, pos.symbol, exit_reason):
+                            pending_modified = True
+                else:
+                    if queue_pending_sell(pending_orders, pos.symbol, exit_reason):
+                        pending_modified = True
+        except Exception as e:
+            logging.error(f"Error managing position for {pos.symbol}: {e}")
+
+    return pending_modified
 
 # --------------------------------------------------
 # 3. Main Execution Loop
@@ -226,43 +523,50 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame):
 if __name__ == '__main__':
     api = REST(key_id=API_KEY, secret_key=SECRET_KEY, base_url=BASE_URL)
     logging.info("--- Starting Continuous Insider Trading Bot with Smart Error Handling ---")
-    
+
+    last_insider_scan = datetime.datetime.min
+    last_position_check = datetime.datetime.min
+
     while True:
+        cycle_start = datetime.datetime.utcnow()
+        pending_orders = load_pending_orders()
+        pending_modified = False
+
         try:
-            usd_per_czk = get_usd_per_czk()
-            if usd_per_czk is None:
-                logging.error("Halting check: could not get exchange rate."); time.sleep(60 * 5); continue
-            capital_per_trade_usd = TRADE_CAPITAL_CZK * usd_per_czk
-            logging.info(f"{TRADE_CAPITAL_CZK} CZK is approx ${capital_per_trade_usd:.2f} USD.")
-
-            seen_trade_ids = load_seen_trade_ids()
-            open_positions = {p.symbol for p in api.list_positions()}
-            logging.info(f"Loaded {len(seen_trade_ids)} seen trade IDs. Holding {len(open_positions)} positions: {list(open_positions)}")
-
-            latest_trades_df = fetch_insider_trades()
-            if not latest_trades_df.empty:
-                new_unseen_trades = latest_trades_df[~latest_trades_df['trade_id'].isin(seen_trade_ids)]
-                if not new_unseen_trades.empty:
-                    logging.info(f"Found {len(new_unseen_trades)} new, unseen insider trades.")
-                    log_trades_as_seen(new_unseen_trades['trade_id'].tolist())
-                    for _, trade in new_unseen_trades.iterrows():
-                        if trade['ticker'] in open_positions:
-                            logging.info(f"Skipping trade for {trade['ticker']}: position already open.")
-                            continue
-                        success = place_simple_market_order(api, trade, capital_per_trade_usd)
-                        if success:
-                            open_positions.add(trade['ticker'])
-                            logging.info(f"Added {trade['ticker']} to in-memory positions to prevent duplicate trades this cycle.")
-                            time.sleep(2)
-                else:
-                    logging.info("No new, unseen trades found since last check.")
-            
-            trade_history_df = load_trade_history()
-            if not trade_history_df.empty:
-                check_and_manage_positions(api, trade_history_df)
-        
+            clock = api.get_clock()
+            is_market_open = clock.is_open
+            logging.info(f"Market open status: {is_market_open}")
         except Exception as e:
-            logging.critical(f"A critical error occurred in the main loop: {e}")
+            logging.error(f"Could not retrieve market clock: {e}")
+            is_market_open = False
 
-        logging.info(f"Sleeping for {CHECK_INTERVAL_MINUTES} minutes...")
-        time.sleep(60 * CHECK_INTERVAL_MINUTES)
+        try:
+            if is_market_open and execute_pending_orders(api, pending_orders):
+                pending_modified = True
+        except Exception as e:
+            logging.error(f"Error while processing queued orders: {e}")
+
+        if (cycle_start - last_insider_scan) >= datetime.timedelta(minutes=INSIDER_SCAN_INTERVAL_MINUTES):
+            try:
+                if process_insider_trades(api, is_market_open, pending_orders):
+                    pending_modified = True
+            except Exception as e:
+                logging.error(f"Error while processing insider trades: {e}")
+            finally:
+                last_insider_scan = cycle_start
+
+        if is_market_open and (cycle_start - last_position_check) >= datetime.timedelta(minutes=POSITION_CHECK_INTERVAL_MINUTES):
+            try:
+                trade_history_df = load_trade_history()
+                if not trade_history_df.empty and check_and_manage_positions(api, trade_history_df, True, pending_orders):
+                    pending_modified = True
+            except Exception as e:
+                logging.error(f"Error during position management: {e}")
+            finally:
+                last_position_check = cycle_start
+
+        if pending_modified:
+            save_pending_orders(pending_orders)
+
+        logging.info(f"Cycle complete. Sleeping for {POLL_INTERVAL_SECONDS} seconds.")
+        time.sleep(POLL_INTERVAL_SECONDS)

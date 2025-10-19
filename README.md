@@ -47,6 +47,10 @@ The script will:
 - Clone the repository into `APP_DIR` (defaults to `/srv/insider-trading`).
 - Create a virtual environment and install dependencies from `requirements.txt`.
 - Install a `systemd` service that runs the bot with automatic restarts.
+- Persist the deployment branch so the service tracks the same remote branch on every restart.
+- Automatically fetch and hard reset to the tracked branch before launching the bot, keeping the deployment up to date.
+
+The selected branch name is stored in `/etc/${SERVICE_NAME}.env` and exposed to the service as the `SERVICE_BRANCH` environment variable. You can rerun the setup script with a different `BRANCH_NAME` to switch tracks; the service will follow the new branch and pull updates automatically on subsequent restarts.
 
 Afterwards, you can view live logs with:
 

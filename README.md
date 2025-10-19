@@ -32,10 +32,14 @@ Trade activity is appended to `trade_history.csv` and seen trades are stored in 
 ## One-command provisioning and auto-updates
 
 Run `scripts/auto_update.py` to provision the virtual environment, install
-dependencies, start `main.py`, and continuously pull updates from `origin/main`.
-It is the only command you need inside a long-running container; the script will
-watch for upstream changes and restart the bot automatically after syncing the
-repository and reinstalling requirements when necessary.
+dependencies, start the service, and continuously pull updates from
+`origin/main`. It is the only command you need inside a long-running container;
+the script will watch for upstream changes and restart the bot automatically
+after syncing the repository and reinstalling requirements when necessary. By
+default it reuses [`scripts/run_service.sh`](scripts/run_service.sh) so the
+Python watcher and the Systemd unit share the exact same launch flow. If you
+prefer to bypass the shell helper, you can still provide a custom `--command`
+and the watcher will keep your process alive and restarted on updates.
 
 ```bash
 # Optional, required only for private repositories

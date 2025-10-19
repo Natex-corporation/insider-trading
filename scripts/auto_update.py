@@ -152,12 +152,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def start_process(command: str) -> subprocess.Popen:
+def start_process(command: str, *, extra_env: Optional[dict[str, str]] = None) -> subprocess.Popen:
     """Start the application command and return the process handle."""
+    process_env = os.environ.copy()
+    if extra_env:
+        process_env.update(extra_env)
+
     return subprocess.Popen(
         command,
         cwd=REPO_ROOT,
         shell=True,
+        env=process_env,
         preexec_fn=os.setsid,  # Allow sending signals to the entire process group.
     )
 
@@ -254,6 +259,7 @@ def main() -> int:
     process: Optional[subprocess.Popen] = None
     venv_python: Optional[Path] = None
     requirements_digest: Optional[str] = None
+    service_env: dict[str, str] = {}
 
     def _shutdown(signum: int, _: Optional[object]) -> None:
         stop_process(process)
@@ -277,16 +283,24 @@ def main() -> int:
 
         service_command = args.command
         if not service_command:
-            service_command = " ".join(
-                [
-                    shlex.quote(str(venv_python)),
-                    shlex.quote(args.app_script),
-                ]
-            )
+            run_service = REPO_ROOT / "scripts" / "run_service.sh"
+            if run_service.exists():
+                service_command = shlex.quote(str(run_service))
+                service_env["SERVICE_BRANCH"] = args.branch
+            else:
+                service_command = " ".join(
+                    [
+                        shlex.quote(str(venv_python)),
+                        shlex.quote(args.app_script),
+                    ]
+                )
 
-        process = start_process(service_command)
+        process = start_process(service_command, extra_env=service_env)
         while True:
             time.sleep(args.interval)
+            if process and process.poll() is not None:
+                process = start_process(service_command, extra_env=service_env)
+                continue
             if check_for_updates(args.branch, env):
                 sync_branch(args.branch, env)
                 if venv_python:
@@ -296,7 +310,7 @@ def main() -> int:
                         requirements_digest,
                     )
                 stop_process(process)
-                process = start_process(service_command)
+                process = start_process(service_command, extra_env=service_env)
     finally:
         stop_process(process)
         _cleanup_token_env(env)

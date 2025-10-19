@@ -29,6 +29,24 @@ python main.py
 
 Trade activity is appended to `trade_history.csv` and seen trades are stored in `seen_insider_trades.log`.
 
+## Continuous update watcher for long-running containers
+
+For a lightweight alternative to the full LXC deployment script, you can run
+`scripts/auto_update.py` alongside the bot. The watcher polls the remote
+`main` branch, pulls new commits, and restarts `main.py` whenever updates are
+available.
+
+```bash
+# Optional, required only for private repositories
+export GITHUB_PAT="<your-token>"
+
+python3 scripts/auto_update.py --interval 300
+```
+
+Use the `--interval` flag (seconds) to control how often the watcher checks for
+updates, and `--command` if you need to launch a different entry point than the
+default `python3 main.py`.
+
 ## Automated deployment to an LXC container
 If you want the bot to auto-update and run inside an LXC container after every push to `main`, this repository includes a helper script. Run the following as `root` inside the container:
 

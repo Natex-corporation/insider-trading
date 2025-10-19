@@ -14,6 +14,7 @@ fi
 APP_DIR="${APP_DIR:-/srv/insider-trading}"
 SERVICE_NAME="${SERVICE_NAME:-insider-trading}"
 BRANCH_NAME="${BRANCH_NAME:-main}"
+ENV_FILE="/etc/${SERVICE_NAME}.env"
 
 apt-get update
 apt-get install -y git python3 python3-venv
@@ -34,6 +35,11 @@ python3 -m venv "${APP_DIR}/.venv"
 
 install -m 755 "${APP_DIR}/scripts/run_service.sh" "${APP_DIR}/run_service.sh"
 
+cat <<ENVFILE > "${ENV_FILE}"
+SERVICE_BRANCH=${BRANCH_NAME}
+ENVFILE
+chmod 644 "${ENV_FILE}"
+
 cat <<SERVICE > "/etc/systemd/system/${SERVICE_NAME}.service"
 [Unit]
 Description=Insider Trading Bot
@@ -42,6 +48,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
+EnvironmentFile=${ENV_FILE}
 ExecStart=${APP_DIR}/run_service.sh
 Restart=always
 RestartSec=10
@@ -51,6 +58,7 @@ WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}.service"
+systemctl enable "${SERVICE_NAME}.service"
+systemctl restart "${SERVICE_NAME}.service"
 
 echo "Deployment complete. View logs with: journalctl -fu ${SERVICE_NAME}.service"

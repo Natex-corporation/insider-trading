@@ -1,0 +1,4 @@
+alpaca-trade-api
+beautifulsoup4
+pandas
+requests

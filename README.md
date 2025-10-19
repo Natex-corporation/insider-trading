@@ -29,12 +29,13 @@ python main.py
 
 Trade activity is appended to `trade_history.csv` and seen trades are stored in `seen_insider_trades.log`.
 
-## Continuous update watcher for long-running containers
+## One-command provisioning and auto-updates
 
-For a lightweight alternative to the full LXC deployment script, you can run
-`scripts/auto_update.py` alongside the bot. The watcher polls the remote
-`main` branch, pulls new commits, and restarts `main.py` whenever updates are
-available.
+Run `scripts/auto_update.py` to provision the virtual environment, install
+dependencies, start `main.py`, and continuously pull updates from `origin/main`.
+It is the only command you need inside a long-running container; the script will
+watch for upstream changes and restart the bot automatically after syncing the
+repository and reinstalling requirements when necessary.
 
 ```bash
 # Optional, required only for private repositories
@@ -43,9 +44,13 @@ export GITHUB_PAT="<your-token>"
 python3 scripts/auto_update.py --interval 300
 ```
 
-Use the `--interval` flag (seconds) to control how often the watcher checks for
-updates, and `--command` if you need to launch a different entry point than the
-default `python3 main.py`.
+Key flags:
+
+- `--interval` — seconds between update checks (default: 300).
+- `--venv-path` — where to create the virtual environment (default: `.venv`).
+- `--app-script` — application entrypoint relative to the repo root (default: `main.py`).
+- `--command` — override the launch command entirely if you prefer to manage the
+  process yourself.
 
 ## Automated deployment to an LXC container
 If you want the bot to auto-update and run inside an LXC container after every push to `main`, this repository includes a helper script. Run the following as `root` inside the container:

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Monitor the remote main branch and restart ``main.py`` when updates arrive.
+"""Provision and maintain the insider-trading service with a single command.
 
-This script is intended to run continuously inside the container that hosts the
-application. It periodically compares the local ``main`` branch with the remote
-branch (``origin/main`` by default). When it detects that the remote branch has
-advanced, it resets the working tree to match the remote, then restarts the
-configured application command (``python3 main.py`` by default).
+This script bootstraps the Python environment, installs dependencies, launches
+``main.py`` from a virtual environment, and keeps the application synchronized
+with the remote ``main`` branch. Whenever new commits land upstream, the script
+hard-resets the local checkout, reapplies dependencies if ``requirements.txt``
+changed, and gracefully restarts the running bot.
 
 Authentication
 -------------
@@ -24,7 +24,9 @@ Example usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -121,9 +123,31 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait between update checks (default: 300)",
     )
     parser.add_argument(
+        "--venv-path",
+        default=str(REPO_ROOT / ".venv"),
+        help="Path to the virtual environment used for the service (default: .venv)",
+    )
+    parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="Python interpreter used to create the virtual environment",
+    )
+    parser.add_argument(
+        "--requirements",
+        default="requirements.txt",
+        help="Path to the dependency requirements file (default: requirements.txt)",
+    )
+    parser.add_argument(
+        "--app-script",
+        default="main.py",
+        help="Application entrypoint relative to the repository root (default: main.py)",
+    )
+    parser.add_argument(
         "--command",
-        default="python3 main.py",
-        help="Command used to run the application (default: python3 main.py)",
+        help=(
+            "Override the command used to run the application. By default the script "
+            "invokes '<venv>/bin/python main.py'."
+        ),
     )
     return parser.parse_args()
 
@@ -159,6 +183,56 @@ def check_for_updates(branch: str, env: dict[str, str]) -> bool:
     return local_ref != remote_ref
 
 
+def ensure_virtualenv(venv_path: Path, python_executable: str) -> Path:
+    """Create the virtual environment if necessary and upgrade ``pip``."""
+    venv_python = venv_path / "bin" / "python"
+    if not venv_python.exists():
+        venv_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [python_executable, "-m", "venv", str(venv_path)],
+            check=True,
+        )
+
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+        check=True,
+    )
+    return venv_python
+
+
+def _file_digest(path: Path) -> Optional[str]:
+    if not path.exists():
+        return None
+
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8192), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def install_requirements(venv_python: Path, requirements_file: Path, previous_digest: Optional[str]) -> Optional[str]:
+    """Install dependencies when the requirements file changes."""
+    current_digest = _file_digest(requirements_file)
+    if current_digest is None:
+        return None
+
+    if current_digest != previous_digest:
+        subprocess.run(
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                str(requirements_file),
+            ],
+            check=True,
+        )
+
+    return current_digest
+
+
 def sync_branch(branch: str, env: dict[str, str]) -> None:
     """Reset the local branch to match the remote branch exactly."""
     _run_git_command(["reset", "--hard", f"origin/{branch}"], env=env)
@@ -178,6 +252,8 @@ def main() -> int:
     args = parse_args()
     env = _with_token_env()
     process: Optional[subprocess.Popen] = None
+    venv_python: Optional[Path] = None
+    requirements_digest: Optional[str] = None
 
     def _shutdown(signum: int, _: Optional[object]) -> None:
         stop_process(process)
@@ -189,13 +265,38 @@ def main() -> int:
 
     try:
         ensure_branch_exists(args.branch, env)
-        process = start_process(args.command)
+        sync_branch(args.branch, env)
+
+        venv_path = Path(args.venv_path).expanduser().resolve()
+        venv_python = ensure_virtualenv(venv_path, args.python)
+
+        requirements_path = Path(args.requirements)
+        if not requirements_path.is_absolute():
+            requirements_path = (REPO_ROOT / requirements_path).resolve()
+        requirements_digest = install_requirements(venv_python, requirements_path, None)
+
+        service_command = args.command
+        if not service_command:
+            service_command = " ".join(
+                [
+                    shlex.quote(str(venv_python)),
+                    shlex.quote(args.app_script),
+                ]
+            )
+
+        process = start_process(service_command)
         while True:
             time.sleep(args.interval)
             if check_for_updates(args.branch, env):
                 sync_branch(args.branch, env)
+                if venv_python:
+                    requirements_digest = install_requirements(
+                        venv_python,
+                        requirements_path,
+                        requirements_digest,
+                    )
                 stop_process(process)
-                process = start_process(args.command)
+                process = start_process(service_command)
     finally:
         stop_process(process)
         _cleanup_token_env(env)

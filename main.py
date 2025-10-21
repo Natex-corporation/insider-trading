@@ -70,7 +70,14 @@ def heartbeat(stage: str, ok: bool = True, note: str = ""):
         log.error(f"Failed to write heartbeat: {exc}")
 
 # --- ALPACA API CONFIGURATION ---
+# Default hard-coded credentials retained per deployment preference.
+# These values can be overridden at runtime by exporting the standard Alpaca
+# environment variables (APCA_API_KEY_ID/APCA_API_SECRET_KEY or
+# ALPACA_API_KEY/ALPACA_SECRET_KEY) if you ever need to rotate the keys without
+# editing source.
 DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
+DEFAULT_API_KEY = "PKDBS69E76P0DIEJF5AR"
+DEFAULT_API_SECRET = "9xnzc0fSSfduish5ocaHIYkOpaBapZChTSX2AqRf"
 
 # --- State Management & Parameters ---
 TRADE_HISTORY_CSV = 'trade_history.csv'
@@ -117,14 +124,16 @@ def infer_direction(txn: str) -> str | None:
 
 
 def load_alpaca_credentials() -> tuple[str, str, str]:
-    key = os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY")
-    secret = os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
+    key = os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY") or DEFAULT_API_KEY
+    secret = (
+        os.environ.get("APCA_API_SECRET_KEY")
+        or os.environ.get("ALPACA_SECRET_KEY")
+        or DEFAULT_API_SECRET
+    )
     base_url = os.environ.get("APCA_API_BASE_URL", DEFAULT_BASE_URL)
 
-    if not key or not secret:
-        raise RuntimeError(
-            "Missing Alpaca credentials. Set APCA_API_KEY_ID/APCA_API_SECRET_KEY or ALPACA_API_KEY/ALPACA_SECRET_KEY."
-        )
+    if (key, secret) == (DEFAULT_API_KEY, DEFAULT_API_SECRET):
+        log.warning("Using hard-coded Alpaca credentials; rotate them if exposed.")
 
     return key, secret, base_url
 

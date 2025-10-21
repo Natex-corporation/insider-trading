@@ -11,7 +11,7 @@ This project demonstrates a simple trading bot that monitors recent insider trad
 ## Requirements
 - Python 3.10+
 - Dependencies listed in [`requirements.txt`](requirements.txt)
-- An Alpaca paper trading account and API keys (currently hard-coded in `main.py`).
+- An Alpaca paper trading account and API keys (default credentials are hard-coded in `main.py`).
 
 Install the Python dependencies with:
 
@@ -20,7 +20,7 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-1. Configure your Alpaca API credentials by exporting environment variables (preferred):
+1. (Optional) Override the default Alpaca API credentials by exporting environment variables:
 
    ```bash
    export APCA_API_KEY_ID="<your-key-id>"
@@ -29,8 +29,9 @@ pip install -r requirements.txt
    # export APCA_API_BASE_URL="https://paper-api.alpaca.markets"
    ```
 
-   The bot refuses to start unless credentials are present. You can also use
-   the legacy names `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` if you prefer.
+   If you skip this step, the hard-coded defaults in `main.py` will be used.
+   You can also use the legacy names `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`
+   if you prefer.
 
 2. Run the bot:
 

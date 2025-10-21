@@ -2,6 +2,7 @@ import datetime
 import functools
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -68,15 +69,13 @@ def heartbeat(stage: str, ok: bool = True, note: str = ""):
     except Exception as exc:
         log.error(f"Failed to write heartbeat: {exc}")
 
-# --- ALPACA API CONFIGURATION (Using hardcoded keys as requested for testing) ---
-# !!! WARNING: These keys are exposed and should be revoked after testing.
-API_KEY = "PKDBS69E76P0DIEJF5AR"
-SECRET_KEY = "9xnzc0fSSfduish5ocaHIYkOpaBapZChTSX2AqRf"
-BASE_URL = "https://paper-api.alpaca.markets"
+# --- ALPACA API CONFIGURATION ---
+DEFAULT_BASE_URL = "https://paper-api.alpaca.markets"
 
 # --- State Management & Parameters ---
 TRADE_HISTORY_CSV = 'trade_history.csv'
 SEEN_TRADES_LOG = 'seen_insider_trades.log'
+SEEN_GROUPS_LOG = 'seen_insider_groups.log'
 PENDING_ORDERS_JSON = 'pending_orders.json'
 
 TRADE_CAPITAL_CZK = 250.0
@@ -116,9 +115,30 @@ def infer_direction(txn: str) -> str | None:
     if 'sell' in lower or 'sale' in lower: return 'sell'
     return None
 
+
+def load_alpaca_credentials() -> tuple[str, str, str]:
+    key = os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY")
+    secret = os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
+    base_url = os.environ.get("APCA_API_BASE_URL", DEFAULT_BASE_URL)
+
+    if not key or not secret:
+        raise RuntimeError(
+            "Missing Alpaca credentials. Set APCA_API_KEY_ID/APCA_API_SECRET_KEY or ALPACA_API_KEY/ALPACA_SECRET_KEY."
+        )
+
+    return key, secret, base_url
+
 # --------------------------------------------------
 # 1. Scrape insider transactions from Finviz
 # --------------------------------------------------
+def build_group_key(ticker: str, direction: str, owner: str | None, insider_date: datetime.date) -> str:
+    owner_normalized = (owner or "").strip().lower()
+    ticker_normalized = (ticker or "").strip().upper()
+    direction_normalized = (direction or "").strip().lower()
+    date_str = insider_date.isoformat() if isinstance(insider_date, datetime.date) else str(insider_date)
+    return "|".join([ticker_normalized, direction_normalized, owner_normalized, date_str])
+
+
 def fetch_insider_trades() -> pd.DataFrame:
     base_url = 'https://finviz.com/insidertrading.ashx'
     all_records = []
@@ -175,6 +195,7 @@ def fetch_insider_trades() -> pd.DataFrame:
                 if cost == 0 or not date:
                     continue
                 trade_id = f"{date.isoformat()}-{ticker}-{direction}-{shares}"
+                group_key = build_group_key(ticker, direction, owner, date)
                 all_records.append(
                     {
                         'trade_id': trade_id,
@@ -183,6 +204,7 @@ def fetch_insider_trades() -> pd.DataFrame:
                         'cost': cost,
                         'insider_date': date,
                         'insider': owner,
+                        'group_key': group_key,
                     }
                 )
             except (ValueError, KeyError, IndexError) as e:
@@ -197,20 +219,76 @@ def fetch_insider_trades() -> pd.DataFrame:
             log.info("No 'next' page link found. Scrape complete.")
             break
 
-    return pd.DataFrame(all_records)
+    df = pd.DataFrame(all_records)
+    if not df.empty and 'group_key' in df.columns:
+        df = df.drop_duplicates(subset=['group_key'], keep='first')
+    return df
 
 # --------------------------------------------------
 # 2. Live Trading Logic and Persistent Memory
 # --------------------------------------------------
 
 def load_seen_trade_ids() -> set:
-    if not os.path.exists(SEEN_TRADES_LOG): return set()
-    with open(SEEN_TRADES_LOG, 'r') as f: return {line.strip() for line in f}
+    if not os.path.exists(SEEN_TRADES_LOG):
+        return set()
+    with open(SEEN_TRADES_LOG, 'r') as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def load_seen_trade_groups() -> set:
+    groups: set[str] = set()
+    if os.path.exists(SEEN_GROUPS_LOG):
+        with open(SEEN_GROUPS_LOG, 'r') as f:
+            groups.update(line.strip() for line in f if line.strip())
+
+    if os.path.exists(TRADE_HISTORY_CSV):
+        try:
+            df = pd.read_csv(TRADE_HISTORY_CSV)
+            if not df.empty:
+                if 'insider_group_key' in df.columns:
+                    history_groups = {
+                        str(value)
+                        for value in df['insider_group_key']
+                        if isinstance(value, str) and value.strip()
+                    }
+                    groups.update(history_groups)
+                else:
+                    fallback_groups = set()
+                    if {'ticker', 'side', 'insider_date'}.issubset(df.columns):
+                        for _, row in df.iterrows():
+                            ticker = row.get('ticker')
+                            direction = row.get('side')
+                            insider_date = row.get('insider_date')
+                            insider = row.get('insider_name') if 'insider_name' in df.columns else None
+                            if pd.isna(ticker) or pd.isna(direction) or pd.isna(insider_date):
+                                continue
+                            try:
+                                insider_dt = datetime.date.fromisoformat(str(insider_date)[:10])
+                            except ValueError:
+                                continue
+                            fallback_groups.add(
+                                build_group_key(str(ticker), str(direction), str(insider) if insider is not None else None, insider_dt)
+                            )
+                    groups.update(fallback_groups)
+        except Exception:
+            pass
+
+    return groups
 
 def log_trades_as_seen(new_trade_ids: list):
     with open(SEEN_TRADES_LOG, 'a') as f:
-        for trade_id in new_trade_ids: f.write(f"{trade_id}\n")
+        for trade_id in new_trade_ids:
+            f.write(f"{trade_id}\n")
     log.info(f"Logged {len(new_trade_ids)} new trades to {SEEN_TRADES_LOG}")
+
+
+def log_trade_groups_as_seen(group_keys: list[str]):
+    if not group_keys:
+        return
+    with open(SEEN_GROUPS_LOG, 'a') as f:
+        for group_key in group_keys:
+            f.write(f"{group_key}\n")
+    log.info(f"Logged {len(group_keys)} trade groups to {SEEN_GROUPS_LOG}")
 
 def load_trade_history() -> pd.DataFrame:
     if not os.path.exists(TRADE_HISTORY_CSV): return pd.DataFrame(columns=['trade_id'])
@@ -241,6 +319,7 @@ def log_trade_to_history(
         'trade_id': trade_info.get('trade_id'), 'timestamp_utc': datetime.datetime.utcnow().isoformat(),
         'ticker': order_obj.symbol, 'side': order_obj.side, 'order_qty': order_obj.qty,
         'insider_date': insider_date_str, 'insider_name': trade_info.get('insider'),
+        'insider_group_key': trade_info.get('group_key'),
         'estimated_entry_price': entry_price, 'take_profit_price': tp_price, 'stop_loss_price': sl_price,
         'alpaca_order_id': order_obj.id, 'status': order_obj.status, 'exit_reason': None,
         'exit_timestamp_utc': None
@@ -310,6 +389,7 @@ def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
     trade_info = trade_details.to_dict() if isinstance(trade_details, pd.Series) else dict(trade_details)
     trade_id = trade_info.get('trade_id')
     ticker = trade_info.get('ticker')
+    group_key = trade_info.get('group_key')
     if not trade_id or not ticker:
         log.warning("Cannot queue trade without trade_id and ticker.")
         return False
@@ -318,6 +398,12 @@ def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
     if trade_id in existing_ids:
         log.info(f"Trade {trade_id} for {ticker} is already queued for execution.")
         return False
+
+    if group_key:
+        existing_groups = {order.get('group_key') for order in pending['buy'] if order.get('group_key')}
+        if group_key in existing_groups:
+            log.info(f"Trade group {group_key} for {ticker} already queued; skipping duplicate.")
+            return False
 
     insider_date = trade_info.get('insider_date')
     if isinstance(insider_date, (datetime.date, datetime.datetime)):
@@ -333,6 +419,7 @@ def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
         'direction': trade_info.get('direction', 'buy'),
         'insider_date': insider_date_str,
         'insider': trade_info.get('insider'),
+        'group_key': group_key,
         'queued_at_utc': datetime.datetime.utcnow().isoformat()
     })
     log.info(f"Queued buy order for {ticker} ({trade_id}) until market hours.")
@@ -444,6 +531,7 @@ def process_insider_trades(
 ) -> bool:
     pending = ensure_pending_structure(pending_orders)
     pending_buy_ids = {order.get('trade_id') for order in pending['buy']}
+    pending_group_keys = {order.get('group_key') for order in pending['buy'] if order.get('group_key')}
 
     try:
         open_positions = {p.symbol for p in api.list_positions()}
@@ -454,29 +542,51 @@ def process_insider_trades(
     can_trade_now = is_market_open and capital_per_trade_usd is not None
 
     seen_trade_ids = load_seen_trade_ids()
+    seen_trade_groups = load_seen_trade_groups()
     latest_trades_df = fetch_insider_trades()
     heartbeat("scrape", note=f"rows={len(latest_trades_df)}")
     if latest_trades_df.empty:
         log.info("No insider trades retrieved in this scan.")
         return False
 
-    new_unseen_trades = latest_trades_df[~latest_trades_df['trade_id'].isin(seen_trade_ids)]
+    if 'group_key' not in latest_trades_df.columns:
+        latest_trades_df['group_key'] = latest_trades_df.apply(
+            lambda row: build_group_key(
+                row.get('ticker'),
+                row.get('direction'),
+                row.get('insider'),
+                row.get('insider_date'),
+            ),
+            axis=1,
+        )
+
+    new_unseen_trades = latest_trades_df[
+        (~latest_trades_df['trade_id'].isin(seen_trade_ids))
+        & (~latest_trades_df['group_key'].isin(seen_trade_groups))
+    ]
     if new_unseen_trades.empty:
         log.info("No new insider trades found since the last scan.")
         return False
 
     log_trades_as_seen(new_unseen_trades['trade_id'].tolist())
+    log_trade_groups_as_seen([
+        key for key in new_unseen_trades['group_key'].tolist() if isinstance(key, str) and key
+    ])
     log.info(f"Found {len(new_unseen_trades)} new insider trades to evaluate.")
 
     queued_count = 0
     for _, trade in new_unseen_trades.iterrows():
         ticker = trade['ticker']
         trade_id = trade['trade_id']
+        group_key = trade.get('group_key')
         if ticker in open_positions:
             log.info(f"Skipping {ticker}: position already open.")
             continue
         if trade_id in pending_buy_ids:
             log.info(f"Skipping {ticker}: trade {trade_id} already queued.")
+            continue
+        if group_key and group_key in pending_group_keys:
+            log.info(f"Skipping {ticker}: trade group {group_key} already queued.")
             continue
 
         if can_trade_now:
@@ -487,6 +597,8 @@ def process_insider_trades(
             success = place_simple_market_order(api, trade, capital_per_trade_usd)
             if success:
                 open_positions.add(ticker)
+                if group_key:
+                    pending_group_keys.add(group_key)
                 heartbeat("order", note=f"buy:{ticker}")
                 time.sleep(2)
             else:
@@ -494,12 +606,40 @@ def process_insider_trades(
         else:
             if queue_pending_trade(pending_orders, trade):
                 pending_buy_ids.add(trade_id)
+                if group_key:
+                    pending_group_keys.add(group_key)
                 queued_count += 1
 
     if queued_count:
         log.info(f"Queued {queued_count} trades for the next market session.")
 
     return queued_count > 0
+
+def _calculate_order_quantity(latest_price: float, capital_usd: float, fractionable: bool) -> float | int | None:
+    if latest_price <= 0:
+        return None
+
+    target_shares = capital_usd / latest_price
+    if fractionable:
+        precise_shares = math.floor(target_shares * 10_000) / 10_000
+        if precise_shares <= 0:
+            return None
+        return precise_shares
+
+    floor_shares = max(1, math.floor(target_shares))
+    ceil_shares = max(floor_shares, math.ceil(target_shares))
+
+    floor_value = floor_shares * latest_price
+    ceil_value = ceil_shares * latest_price
+    target_value = capital_usd
+
+    floor_diff = abs(target_value - floor_value)
+    ceil_diff = abs(target_value - ceil_value)
+
+    if ceil_diff < floor_diff and ceil_value <= target_value * 1.1:
+        return ceil_shares
+    return floor_shares
+
 
 def place_simple_market_order(api: REST, trade_details, capital_usd: float) -> bool:
     """
@@ -519,18 +659,25 @@ def place_simple_market_order(api: REST, trade_details, capital_usd: float) -> b
     try:
         latest_price = api.get_latest_trade(symbol).price
     except Exception as e:
-        log.error(f"Could not get latest price for {symbol}. Skipping. Error: {e}"); return False
+        log.error(f"Could not get latest price for {symbol}. Skipping. Error: {e}")
+        return False
 
+    if side not in {'buy', 'sell'}:
+        log.error(f"Unknown side '{side}' for {symbol}.")
+        return False
+
+    fractionable = True
     if side == 'buy':
-        qty = round(capital_usd / latest_price, 4)
-        if qty <= 0.0001:
-            log.warning(f"Capital of ${capital_usd:.2f} is too low to trade {symbol}."); return False
-    elif side == 'sell':
-        qty = int(capital_usd / latest_price)
-        if qty < 1:
-            log.warning(f"Capital of ${capital_usd:.2f} is too low to short 1 share of {symbol}."); return False
-    else:
-        log.error(f"Unknown side '{side}' for {symbol}."); return False
+        try:
+            asset = api.get_asset(symbol)
+            fractionable = bool(getattr(asset, 'fractionable', True))
+        except Exception as e:
+            log.warning(f"Could not determine if {symbol} is fractionable: {e}. Assuming fractionable.")
+
+    qty = _calculate_order_quantity(latest_price, capital_usd, fractionable if side == 'buy' else False)
+    if qty is None:
+        log.warning(f"Capital of ${capital_usd:.2f} is too low to trade {symbol} at ${latest_price:.2f}.")
+        return False
 
     if side == 'buy':
         tp_price = round(latest_price * (1 + TAKE_PROFIT_PERCENT / 100), 2)
@@ -628,7 +775,13 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame, is_mar
 # 3. Main Execution Loop
 # --------------------------------------------------
 if __name__ == '__main__':
-    api = REST(key_id=API_KEY, secret_key=SECRET_KEY, base_url=BASE_URL)
+    try:
+        api_key, api_secret, api_base_url = load_alpaca_credentials()
+    except RuntimeError as credential_error:
+        log.critical(f"Cannot start bot without Alpaca credentials: {credential_error}")
+        sys.exit(1)
+
+    api = REST(key_id=api_key, secret_key=api_secret, base_url=api_base_url)
     try:
         orig_request = api._session.request
         api._session.request = functools.partial(orig_request, timeout=REQUEST_TIMEOUT)

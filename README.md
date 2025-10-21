@@ -20,14 +20,29 @@ pip install -r requirements.txt
 ```
 
 ## Usage
-1. Configure your Alpaca API credentials in `main.py` or supply them via environment variables.
+1. Configure your Alpaca API credentials by exporting environment variables (preferred):
+
+   ```bash
+   export APCA_API_KEY_ID="<your-key-id>"
+   export APCA_API_SECRET_KEY="<your-secret-key>"
+   # Optional: override the default paper trading URL
+   # export APCA_API_BASE_URL="https://paper-api.alpaca.markets"
+   ```
+
+   The bot refuses to start unless credentials are present. You can also use
+   the legacy names `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` if you prefer.
+
 2. Run the bot:
 
 ```bash
 python main.py
 ```
 
-Trade activity is appended to `trade_history.csv` and seen trades are stored in `seen_insider_trades.log`.
+Trade activity is appended to `trade_history.csv` (including the insider group
+identifier for each execution) and seen trades are stored in
+`seen_insider_trades.log`. Related filings from the same insider and date are
+grouped, so the bot will only place one order per clustered sale even when the
+filing appears in multiple line items.
 
 ## One-command provisioning and auto-updates
 

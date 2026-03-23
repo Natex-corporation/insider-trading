@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+data
+app.log
+heartbeat.txt
+pending_orders.json
+seen_insider_trades.log
+trade_history.csv

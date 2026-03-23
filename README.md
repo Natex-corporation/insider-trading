@@ -1,62 +1,147 @@
 # Insider Trading Bot
 
-This project demonstrates a simple trading bot that monitors recent insider trades from [Finviz](https://finviz.com/insidertrading.ashx) and executes corresponding trades using the Alpaca paper trading API.
+This repository contains a long-running Python bot that watches recent insider trades on [Finviz](https://finviz.com/insidertrading.ashx) and mirrors them into an Alpaca paper-trading account.
 
-## Features
-- Scrapes insider trading activity from Finviz.
-- Persists already-seen trades to avoid duplicate orders.
-- Places market orders through Alpaca and logs each execution.
-- Records trade history in CSV format for later analysis.
+## What This Project Is
 
-## Requirements
-- Python 3.10+
-- Dependencies listed in [`requirements.txt`](requirements.txt)
-- An Alpaca paper trading account and API keys (currently hard-coded in `main.py`).
+At a high level, the bot does this in a loop:
 
-Install the Python dependencies with:
+1. Checks whether the US market is open through Alpaca.
+2. Fetches the latest insider-trading table from Finviz.
+3. Converts each row into a simple trade signal (`buy` or `sell`).
+4. Ignores signals it has already processed.
+5. Places a market order in Alpaca when the market is open, or queues it for later.
+6. Tracks open positions and closes them when the configured take-profit target is reached.
+7. Writes trade history, queue state, logs, and heartbeat data to disk.
+
+## What It Actually Trades
+
+The strategy is intentionally simple:
+
+- It uses a fixed per-trade budget in CZK (`TRADE_CAPITAL_CZK`, default `250`).
+- It converts that budget to USD each cycle.
+- It buys or sells based only on the Finviz transaction label.
+- It uses a take-profit target (`TAKE_PROFIT_PERCENT`, default `10`).
+- It does not use a stop loss.
+- It does not score insider quality, company quality, liquidity, or risk.
+- It avoids duplicate orders by recording processed insider-trade IDs.
+
+This means it is closer to an automation prototype than a production trading system.
+
+## Runtime Files
+
+By default, the bot writes state into the repository directory. In the container setup, it writes to `/data`.
+
+- `trade_history.csv`: submitted orders and recorded exits.
+- `seen_insider_trades.log`: signal IDs already processed.
+- `pending_orders.json`: orders queued until the market reopens.
+- `heartbeat.txt`: loop and stage heartbeat log.
+- `app.log`: rotating application log file.
+
+## Monitoring
+
+The bot now exposes a lightweight monitoring server. By default it listens on port `8080`.
+
+- `/`: small HTML status page.
+- `/healthz`: liveness endpoint for Docker health checks.
+- `/readyz`: same heartbeat-based readiness signal.
+- `/status`: JSON snapshot of the bot state.
+- `/metrics`: Prometheus-style text metrics.
+
+The Docker image uses `scripts/healthcheck.py`, which checks `/healthz` and marks the container unhealthy if the bot stops heartbeating.
+
+## Configuration
+
+The bot now reads credentials and runtime settings from environment variables.
+
+Required:
+
+- `ALPACA_API_KEY`
+- `ALPACA_SECRET_KEY`
+
+Common optional settings:
+
+- `ALPACA_BASE_URL` default: `https://paper-api.alpaca.markets`
+- `TRADE_CAPITAL_CZK` default: `250`
+- `TAKE_PROFIT_PERCENT` default: `10`
+- `INSIDER_SCAN_INTERVAL_MINUTES` default: `15`
+- `POSITION_CHECK_INTERVAL_MINUTES` default: `5`
+- `MARKET_OPEN_POLL_SECONDS` default: `60`
+- `MARKET_CLOSED_POLL_SECONDS` default: `900`
+- `STATE_DIR` default: repository directory
+- `LOG_DIR` default: repository directory
+- `MONITORING_ENABLED` default: `true`
+- `MONITORING_PORT` default: `8080`
+
+See [.env.example](.env.example) for a working container example.
+
+Important: older revisions of this repository contained hard-coded Alpaca paper keys. If those keys were ever valid, revoke them.
+
+## Local Python Run
+
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
-1. Configure your Alpaca API credentials in `main.py` or supply them via environment variables.
-2. Run the bot:
+Run the bot:
 
 ```bash
-python main.py
+ALPACA_API_KEY=... ALPACA_SECRET_KEY=... python main.py
 ```
 
-Trade activity is appended to `trade_history.csv` and seen trades are stored in `seen_insider_trades.log`.
+## Docker Run
 
-## Automated deployment to an LXC container
-If you want the bot to auto-update and run inside an LXC container after every push to `main`, this repository includes a helper script. Run the following as `root` inside the container:
+Build and start:
 
 ```bash
-export REPO_URL="https://github.com/<your-org>/insider-trading.git"
-# Optional overrides:
-# export APP_DIR="/srv/insider-trading"
-# export BRANCH_NAME="main"
-# export SERVICE_NAME="insider-trading"
-
-bash scripts/setup_lxc.sh
+docker compose up -d --build
 ```
 
-The script will:
-- Install Git and Python tooling.
-- Clone the repository into `APP_DIR` (defaults to `/srv/insider-trading`).
-- Create a virtual environment and install dependencies from `requirements.txt`.
-- Install a `systemd` service that runs the bot with automatic restarts.
-- Persist the deployment branch so the service tracks the same remote branch on every restart.
-- Automatically fetch and hard reset to the tracked branch before launching the bot, keeping the deployment up to date.
+The included `docker-compose.yml`:
 
-The selected branch name is stored in `/etc/${SERVICE_NAME}.env` and exposed to the service as the `SERVICE_BRANCH` environment variable. You can rerun the setup script with a different `BRANCH_NAME` to switch tracks; the service will follow the new branch and pull updates automatically on subsequent restarts.
+- builds the image from the local `Dockerfile`
+- loads variables from `.env`
+- persists runtime state in `./data`
+- exposes the monitoring UI on port `8080`
 
-Afterwards, you can view live logs with:
+## TrueNAS Deployment
 
-```bash
-journalctl -fu insider-trading.service
-```
+This repository now includes two paths that fit a TrueNAS-style deployment:
+
+### Option 1: Publish an image and deploy it as a custom app
+
+Use the included GitHub Actions workflow at [.github/workflows/publish-image.yml](.github/workflows/publish-image.yml) to publish the image to GHCR on pushes to `main`.
+
+Then use [truenas-compose.yaml](truenas-compose.yaml) as the template for your TrueNAS custom app:
+
+- the default image is already set to `ghcr.io/natex-corporation/insider-trading:latest`
+- replace `/mnt/POOLNAME/apps/insider-trading:/data` with a real dataset path on your NAS
+- set your Alpaca credentials in the environment section
+
+This is the cleanest approach for TrueNAS because the server pulls a ready-made image and keeps bot state in a mounted dataset.
+
+If you want the YAML generated for you, use [scripts/render_truenas_compose.py](scripts/render_truenas_compose.py) and see [TRUENAS_DEPLOY.md](TRUENAS_DEPLOY.md).
+
+### Option 2: Run it on a normal Docker host first
+
+If you want to validate behavior before moving it to TrueNAS, use the local `docker-compose.yml`, then deploy the same image to TrueNAS later.
+
+## Legacy LXC Deployment
+
+The old LXC/systemd helper is still present in [scripts/setup_lxc.sh](scripts/setup_lxc.sh), but it now requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` to be set before running the installer.
+
+## Files Added For Container Migration
+
+- [Dockerfile](Dockerfile): container image definition
+- [docker-compose.yml](docker-compose.yml): local Docker deployment
+- [truenas-compose.yaml](truenas-compose.yaml): TrueNAS custom-app template
+- [scripts/healthcheck.py](scripts/healthcheck.py): health probe used by Docker
+- [scripts/render_truenas_compose.py](scripts/render_truenas_compose.py): generates a TrueNAS-ready custom-app YAML
+- [config.py](config.py): environment-driven config loader
+- [monitoring.py](monitoring.py): health, status, and metrics server
 
 ## Disclaimer
-This repository is for educational purposes only. Trading in financial markets carries risk; use at your own discretion.
+
+This repository is for educational use. It submits automated paper trades and depends on third-party websites and APIs that can change without notice. Use it only after reviewing the code and understanding the risks.

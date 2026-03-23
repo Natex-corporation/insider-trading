@@ -1,0 +1,24 @@
+services:
+  insider-trading:
+    image: ghcr.io/natex-corporation/insider-trading:latest
+    container_name: insider-trading
+    restart: unless-stopped
+    environment:
+      ALPACA_API_KEY: "replace-me"
+      ALPACA_SECRET_KEY: "replace-me"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      TRADE_CAPITAL_CZK: "250"
+      TAKE_PROFIT_PERCENT: "10"
+      INSIDER_SCAN_INTERVAL_MINUTES: "15"
+      POSITION_CHECK_INTERVAL_MINUTES: "5"
+      MARKET_OPEN_POLL_SECONDS: "60"
+      MARKET_CLOSED_POLL_SECONDS: "900"
+      STATE_DIR: "/data"
+      LOG_DIR: "/data/logs"
+      MONITORING_ENABLED: "true"
+      MONITORING_HOST: "0.0.0.0"
+      MONITORING_PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - /mnt/POOLNAME/apps/insider-trading:/data

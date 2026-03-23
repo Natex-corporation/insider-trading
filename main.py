@@ -15,10 +15,19 @@ from logging.handlers import RotatingFileHandler
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from config import load_config
+from monitoring import RuntimeState, start_monitoring_server
+
+
+try:
+    CONFIG = load_config()
+except ValueError as exc:
+    raise SystemExit(str(exc)) from exc
+
 # --- Basic Setup ---
-REQUEST_TIMEOUT = (10, 25)  # (connect, read) seconds
-HEARTBEAT_FILE = 'heartbeat.txt'
-APP_LOG_FILE = 'app.log'
+REQUEST_TIMEOUT = CONFIG.request_timeout
+HEARTBEAT_FILE = CONFIG.heartbeat_file
+APP_LOG_FILE = CONFIG.app_log_file
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -34,6 +43,7 @@ file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(messag
 logger.addHandler(file_handler)
 
 log = logging.getLogger(__name__)
+RUNTIME_STATE = RuntimeState(CONFIG.health_max_age_seconds)
 
 
 def make_session() -> requests.Session:
@@ -61,30 +71,31 @@ def heartbeat(stage: str, ok: bool = True, note: str = ""):
         timestamp = datetime.datetime.utcnow().isoformat() + "Z"
         status = "OK" if ok else "ERR"
         line = f"{timestamp}\t{stage}\t{status}\t{note}\n"
-        with open(HEARTBEAT_FILE, "a") as hb:
+        with open(HEARTBEAT_FILE, "a", encoding="utf-8") as hb:
             hb.write(line)
             hb.flush()
             os.fsync(hb.fileno())
     except Exception as exc:
         log.error(f"Failed to write heartbeat: {exc}")
+    finally:
+        RUNTIME_STATE.record_heartbeat(stage, ok=ok, note=note)
 
-# --- ALPACA API CONFIGURATION (Using hardcoded keys as requested for testing) ---
-# !!! WARNING: These keys are exposed and should be revoked after testing.
-API_KEY = "PKDBS69E76P0DIEJF5AR"
-SECRET_KEY = "9xnzc0fSSfduish5ocaHIYkOpaBapZChTSX2AqRf"
-BASE_URL = "https://paper-api.alpaca.markets"
+# --- ALPACA API CONFIGURATION ---
+API_KEY = CONFIG.api_key
+SECRET_KEY = CONFIG.secret_key
+BASE_URL = CONFIG.base_url
 
 # --- State Management & Parameters ---
-TRADE_HISTORY_CSV = 'trade_history.csv'
-SEEN_TRADES_LOG = 'seen_insider_trades.log'
-PENDING_ORDERS_JSON = 'pending_orders.json'
+TRADE_HISTORY_CSV = CONFIG.trade_history_csv
+SEEN_TRADES_LOG = CONFIG.seen_trades_log
+PENDING_ORDERS_JSON = CONFIG.pending_orders_json
 
-TRADE_CAPITAL_CZK = 250.0
-TAKE_PROFIT_PERCENT = 10.0
-INSIDER_SCAN_INTERVAL_MINUTES = 15
-POSITION_CHECK_INTERVAL_MINUTES = 5
-MARKET_OPEN_POLL_SECONDS = 60
-MARKET_CLOSED_POLL_SECONDS = INSIDER_SCAN_INTERVAL_MINUTES * 60
+TRADE_CAPITAL_CZK = CONFIG.trade_capital_czk
+TAKE_PROFIT_PERCENT = CONFIG.take_profit_percent
+INSIDER_SCAN_INTERVAL_MINUTES = CONFIG.insider_scan_interval_minutes
+POSITION_CHECK_INTERVAL_MINUTES = CONFIG.position_check_interval_minutes
+MARKET_OPEN_POLL_SECONDS = CONFIG.market_open_poll_seconds
+MARKET_CLOSED_POLL_SECONDS = CONFIG.market_closed_poll_seconds
 
 
 def get_usd_per_czk() -> float | None:
@@ -203,19 +214,43 @@ def fetch_insider_trades() -> pd.DataFrame:
 # 2. Live Trading Logic and Persistent Memory
 # --------------------------------------------------
 
+
+def refresh_trade_history_metrics() -> None:
+    try:
+        if not TRADE_HISTORY_CSV.exists():
+            RUNTIME_STATE.set_trade_history_rows(0)
+            return
+        df = pd.read_csv(TRADE_HISTORY_CSV)
+        RUNTIME_STATE.set_trade_history_rows(len(df.index))
+    except pd.errors.EmptyDataError:
+        RUNTIME_STATE.set_trade_history_rows(0)
+    except Exception as exc:
+        log.warning(f"Could not refresh trade history metrics: {exc}")
+
+
 def load_seen_trade_ids() -> set:
-    if not os.path.exists(SEEN_TRADES_LOG): return set()
-    with open(SEEN_TRADES_LOG, 'r') as f: return {line.strip() for line in f}
+    if not SEEN_TRADES_LOG.exists():
+        return set()
+    with open(SEEN_TRADES_LOG, 'r', encoding='utf-8') as f:
+        return {line.strip() for line in f}
 
 def log_trades_as_seen(new_trade_ids: list):
-    with open(SEEN_TRADES_LOG, 'a') as f:
-        for trade_id in new_trade_ids: f.write(f"{trade_id}\n")
+    with open(SEEN_TRADES_LOG, 'a', encoding='utf-8') as f:
+        for trade_id in new_trade_ids:
+            f.write(f"{trade_id}\n")
     log.info(f"Logged {len(new_trade_ids)} new trades to {SEEN_TRADES_LOG}")
 
 def load_trade_history() -> pd.DataFrame:
-    if not os.path.exists(TRADE_HISTORY_CSV): return pd.DataFrame(columns=['trade_id'])
-    try: return pd.read_csv(TRADE_HISTORY_CSV)
-    except pd.errors.EmptyDataError: return pd.DataFrame(columns=['trade_id'])
+    if not TRADE_HISTORY_CSV.exists():
+        RUNTIME_STATE.set_trade_history_rows(0)
+        return pd.DataFrame(columns=['trade_id'])
+    try:
+        df = pd.read_csv(TRADE_HISTORY_CSV)
+        RUNTIME_STATE.set_trade_history_rows(len(df.index))
+        return df
+    except pd.errors.EmptyDataError:
+        RUNTIME_STATE.set_trade_history_rows(0)
+        return pd.DataFrame(columns=['trade_id'])
 
 def log_trade_to_history(
     trade_details,
@@ -245,14 +280,15 @@ def log_trade_to_history(
         'alpaca_order_id': order_obj.id, 'status': order_obj.status, 'exit_reason': None,
         'exit_timestamp_utc': None
     }
-    file_exists = os.path.exists(TRADE_HISTORY_CSV)
+    file_exists = TRADE_HISTORY_CSV.exists()
     df = pd.DataFrame([record])
     df.to_csv(TRADE_HISTORY_CSV, mode='a', header=not file_exists, index=False)
     log.info(f"Successfully logged trade execution {record['trade_id']} to {TRADE_HISTORY_CSV}")
+    refresh_trade_history_metrics()
 
 
 def update_trade_exit_in_history(symbol: str, exit_reason: str):
-    if not os.path.exists(TRADE_HISTORY_CSV):
+    if not TRADE_HISTORY_CSV.exists():
         return
     try:
         df = pd.read_csv(TRADE_HISTORY_CSV)
@@ -276,6 +312,7 @@ def update_trade_exit_in_history(symbol: str, exit_reason: str):
     df.loc[idx, 'exit_timestamp_utc'] = datetime.datetime.utcnow().isoformat()
     df.to_csv(TRADE_HISTORY_CSV, index=False)
     log.info(f"Updated trade history for {symbol} with exit reason '{exit_reason}'.")
+    RUNTIME_STATE.set_trade_history_rows(len(df.index))
 
 
 def ensure_pending_structure(data: dict | None) -> dict:
@@ -287,22 +324,29 @@ def ensure_pending_structure(data: dict | None) -> dict:
 
 
 def load_pending_orders() -> dict:
-    if not os.path.exists(PENDING_ORDERS_JSON):
-        return {'buy': [], 'sell': []}
+    if not PENDING_ORDERS_JSON.exists():
+        empty_queue = {'buy': [], 'sell': []}
+        RUNTIME_STATE.update_pending_orders(empty_queue)
+        return empty_queue
     try:
-        with open(PENDING_ORDERS_JSON, 'r') as f:
+        with open(PENDING_ORDERS_JSON, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         log.error(f"Could not read {PENDING_ORDERS_JSON}: {e}. Starting with empty queue.")
-        return {'buy': [], 'sell': []}
-    return ensure_pending_structure(data)
+        empty_queue = {'buy': [], 'sell': []}
+        RUNTIME_STATE.update_pending_orders(empty_queue)
+        return empty_queue
+    normalized = ensure_pending_structure(data)
+    RUNTIME_STATE.update_pending_orders(normalized)
+    return normalized
 
 
 def save_pending_orders(pending_orders: dict):
     data = ensure_pending_structure(pending_orders)
-    with open(PENDING_ORDERS_JSON, 'w') as f:
+    with open(PENDING_ORDERS_JSON, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2)
     log.info(f"Persisted pending orders queue to {PENDING_ORDERS_JSON}.")
+    RUNTIME_STATE.update_pending_orders(data)
 
 
 def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
@@ -336,6 +380,7 @@ def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
         'queued_at_utc': datetime.datetime.utcnow().isoformat()
     })
     log.info(f"Queued buy order for {ticker} ({trade_id}) until market hours.")
+    RUNTIME_STATE.update_pending_orders(pending)
     return True
 
 
@@ -357,6 +402,7 @@ def queue_pending_sell(pending_orders: dict, symbol: str, reason: str) -> bool:
         'queued_at_utc': datetime.datetime.utcnow().isoformat()
     })
     log.info(f"Queued sell order for {symbol} due to {reason}.")
+    RUNTIME_STATE.update_pending_orders(pending)
     return True
 
 
@@ -433,6 +479,7 @@ def execute_pending_orders(
         if len(remaining_buy_orders) != len(buy_orders):
             modified = True
 
+    RUNTIME_STATE.update_pending_orders(pending)
     return modified
 
 
@@ -455,6 +502,7 @@ def process_insider_trades(
 
     seen_trade_ids = load_seen_trade_ids()
     latest_trades_df = fetch_insider_trades()
+    RUNTIME_STATE.set_latest_scrape_rows(len(latest_trades_df.index))
     heartbeat("scrape", note=f"rows={len(latest_trades_df)}")
     if latest_trades_df.empty:
         log.info("No insider trades retrieved in this scan.")
@@ -628,6 +676,23 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame, is_mar
 # 3. Main Execution Loop
 # --------------------------------------------------
 if __name__ == '__main__':
+    refresh_trade_history_metrics()
+    if CONFIG.monitoring_enabled:
+        try:
+            start_monitoring_server(
+                RUNTIME_STATE,
+                host=CONFIG.monitoring_host,
+                port=CONFIG.monitoring_port,
+                log=log,
+            )
+            log.info(
+                "Monitoring server listening on http://%s:%s",
+                CONFIG.monitoring_host,
+                CONFIG.monitoring_port,
+            )
+        except Exception as exc:
+            log.error(f"Failed to start monitoring server: {exc}")
+
     api = REST(key_id=API_KEY, secret_key=SECRET_KEY, base_url=BASE_URL)
     try:
         orig_request = api._session.request
@@ -637,6 +702,9 @@ if __name__ == '__main__':
         log.warning("Could not attach timeout to Alpaca session; continuing anyway.")
 
     log.info("--- Starting Continuous Insider Trading Bot with Smart Error Handling ---")
+    log.info("State directory: %s", CONFIG.state_dir)
+    log.info("Trade history file: %s", TRADE_HISTORY_CSV)
+    log.info("Pending orders file: %s", PENDING_ORDERS_JSON)
 
     last_insider_scan = datetime.datetime.min
     last_position_check = datetime.datetime.min
@@ -652,10 +720,12 @@ if __name__ == '__main__':
             try:
                 clock = api.get_clock()
                 is_market_open = clock.is_open
+                RUNTIME_STATE.set_market_open(is_market_open)
                 log.info(f"Market open status: {is_market_open}")
                 heartbeat("alpaca_clock", note="open" if is_market_open else "closed")
             except Exception as e:
                 log.error(f"Could not retrieve market clock: {e}")
+                RUNTIME_STATE.set_market_open(None)
                 heartbeat("alpaca_clock", ok=False, note=str(e))
                 is_market_open = False
 
@@ -668,7 +738,7 @@ if __name__ == '__main__':
                     heartbeat("fx", ok=False, note="rate_unavailable")
                 else:
                     capital_per_trade_usd = TRADE_CAPITAL_CZK * usd_per_czk
-                    log.info(f"{TRADE_CAPITAL_CZK} CZK ≈ ${capital_per_trade_usd:.2f} USD")
+                    log.info(f"{TRADE_CAPITAL_CZK} CZK ~= ${capital_per_trade_usd:.2f} USD")
                     heartbeat("fx", note=f"{usd_per_czk:.4f}")
             else:
                 heartbeat("fx", note="market_closed")
@@ -737,6 +807,8 @@ if __name__ == '__main__':
 
         if pending_modified:
             save_pending_orders(pending_orders)
+        else:
+            RUNTIME_STATE.update_pending_orders(pending_orders)
 
         sleep_seconds = (
             MARKET_OPEN_POLL_SECONDS if is_market_open else MARKET_CLOSED_POLL_SECONDS

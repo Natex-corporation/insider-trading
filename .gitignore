@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+app.log
+heartbeat.txt
+pending_orders.json
+seen_insider_trades.log
+trade_history.csv
+truenas-compose.generated.yaml

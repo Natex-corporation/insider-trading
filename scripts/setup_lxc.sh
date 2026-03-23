@@ -11,15 +11,23 @@ if [[ -z "${REPO_URL:-}" ]]; then
   exit 1
 fi
 
+if [[ -z "${ALPACA_API_KEY:-}" || -z "${ALPACA_SECRET_KEY:-}" ]]; then
+  echo "Set ALPACA_API_KEY and ALPACA_SECRET_KEY before running the setup script." >&2
+  exit 1
+fi
+
 APP_DIR="${APP_DIR:-/srv/insider-trading}"
 SERVICE_NAME="${SERVICE_NAME:-insider-trading}"
 BRANCH_NAME="${BRANCH_NAME:-main}"
 ENV_FILE="/etc/${SERVICE_NAME}.env"
+STATE_DIR="${STATE_DIR:-${APP_DIR}/data}"
+LOG_DIR="${LOG_DIR:-${STATE_DIR}/logs}"
 
 apt-get update
 apt-get install -y git python3 python3-venv
 
 mkdir -p "${APP_DIR}"
+mkdir -p "${STATE_DIR}" "${LOG_DIR}"
 if [[ ! -d "${APP_DIR}/.git" ]]; then
   git clone "${REPO_URL}" "${APP_DIR}"
 else
@@ -37,6 +45,14 @@ install -m 755 "${APP_DIR}/scripts/run_service.sh" "${APP_DIR}/run_service.sh"
 
 cat <<ENVFILE > "${ENV_FILE}"
 SERVICE_BRANCH=${BRANCH_NAME}
+ALPACA_API_KEY=${ALPACA_API_KEY}
+ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
+STATE_DIR=${STATE_DIR}
+LOG_DIR=${LOG_DIR}
+MONITORING_ENABLED=${MONITORING_ENABLED:-true}
+MONITORING_HOST=${MONITORING_HOST:-0.0.0.0}
+MONITORING_PORT=${MONITORING_PORT:-8080}
 ENVFILE
 chmod 644 "${ENV_FILE}"
 

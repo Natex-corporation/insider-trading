@@ -16,11 +16,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-RUN useradd --create-home --shell /bin/bash appuser \
-    && mkdir -p /data/logs \
-    && chown -R appuser:appuser /app /data
-
-USER appuser
+RUN mkdir -p /data/logs
 
 EXPOSE 8080
 

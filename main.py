@@ -1,5 +1,6 @@
 import datetime
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from urllib3.util.retry import Retry
 
 from config import load_config
 from monitoring import RuntimeState, start_monitoring_server
+from storage import Storage
 
 
 try:
@@ -28,6 +30,7 @@ except ValueError as exc:
 REQUEST_TIMEOUT = CONFIG.request_timeout
 HEARTBEAT_FILE = CONFIG.heartbeat_file
 APP_LOG_FILE = CONFIG.app_log_file
+SQLITE_DB_PATH = CONFIG.sqlite_db_path
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -89,6 +92,7 @@ BASE_URL = CONFIG.base_url
 TRADE_HISTORY_CSV = CONFIG.trade_history_csv
 SEEN_TRADES_LOG = CONFIG.seen_trades_log
 PENDING_ORDERS_JSON = CONFIG.pending_orders_json
+STATE_DB_PATH = CONFIG.sqlite_db_path
 
 TRADE_CAPITAL_CZK = CONFIG.trade_capital_czk
 TAKE_PROFIT_PERCENT = CONFIG.take_profit_percent
@@ -96,6 +100,25 @@ INSIDER_SCAN_INTERVAL_MINUTES = CONFIG.insider_scan_interval_minutes
 POSITION_CHECK_INTERVAL_MINUTES = CONFIG.position_check_interval_minutes
 MARKET_OPEN_POLL_SECONDS = CONFIG.market_open_poll_seconds
 MARKET_CLOSED_POLL_SECONDS = CONFIG.market_closed_poll_seconds
+
+OPTIONS_NOISE_PATTERN = re.compile(
+    r"(option|exercise|derivative|convert|conversion|grant|award)",
+    re.IGNORECASE,
+)
+STORAGE = Storage(
+    db_path=STATE_DB_PATH,
+    trade_history_csv=TRADE_HISTORY_CSV,
+    seen_trades_log=SEEN_TRADES_LOG,
+    pending_orders_json=PENDING_ORDERS_JSON,
+    log=log,
+)
+
+
+def refresh_runtime_views() -> None:
+    RUNTIME_STATE.update_pending_orders(STORAGE.get_pending_summary())
+    RUNTIME_STATE.set_trade_history_rows(STORAGE.count_trade_history())
+    RUNTIME_STATE.set_queue_preview(STORAGE.get_queue_preview())
+    RUNTIME_STATE.set_insider_leaderboard(STORAGE.get_insider_leaderboard())
 
 
 def get_usd_per_czk() -> float | None:
@@ -111,6 +134,43 @@ def get_usd_per_czk() -> float | None:
         log.error(f"Could not fetch CZK to USD exchange rate: {e}")
         return None
 
+
+def effective_insider_scan_interval_minutes(is_market_open: bool) -> int:
+    target = 2 if is_market_open else 5
+    return max(1, min(INSIDER_SCAN_INTERVAL_MINUTES, target))
+
+
+def effective_position_check_interval_minutes() -> int:
+    return max(1, min(POSITION_CHECK_INTERVAL_MINUTES, 2))
+
+
+def normalize_utc_datetime(value: datetime.datetime | None) -> datetime.datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def compute_sleep_seconds(
+    *,
+    is_market_open: bool,
+    pending_orders: dict,
+    next_open_at: datetime.datetime | None,
+) -> int:
+    if is_market_open:
+        return max(15, min(MARKET_OPEN_POLL_SECONDS, 30))
+
+    has_pending = bool((pending_orders.get("buy") or []) or (pending_orders.get("sell") or []))
+    if has_pending:
+        normalized_next_open = normalize_utc_datetime(next_open_at)
+        if normalized_next_open is not None:
+            seconds_until_open = max(15, int((normalized_next_open - datetime.datetime.utcnow()).total_seconds()))
+            return min(seconds_until_open, 60)
+        return max(15, min(MARKET_CLOSED_POLL_SECONDS, 60))
+
+    return max(60, min(MARKET_CLOSED_POLL_SECONDS, 300))
+
 def parse_finviz_date(raw: str) -> datetime.date | None:
     # This function is from your script and remains unchanged.
     try: return datetime.datetime.strptime(raw.strip(), "%b %d '%y").date()
@@ -121,11 +181,51 @@ def parse_finviz_date(raw: str) -> datetime.date | None:
         except Exception: return None
 
 def infer_direction(txn: str) -> str | None:
-    # This function is from your script and remains unchanged.
     lower = txn.lower()
     if 'buy' in lower: return 'buy'
     if 'sell' in lower or 'sale' in lower: return 'sell'
     return None
+
+
+def classify_options_noise(records: list[dict]) -> list[dict]:
+    option_groups: set[tuple[str, str, str, int]] = set()
+    for record in records:
+        transaction_type = str(record.get("transaction_type") or "")
+        if OPTIONS_NOISE_PATTERN.search(transaction_type):
+            option_groups.add(
+                (
+                    str(record.get("ticker") or ""),
+                    str(record.get("insider") or ""),
+                    str(record.get("insider_date") or ""),
+                    int(record.get("shares") or 0),
+                )
+            )
+
+    for record in records:
+        filter_reason = record.get("filter_reason")
+        transaction_type = str(record.get("transaction_type") or "")
+        group_key = (
+            str(record.get("ticker") or ""),
+            str(record.get("insider") or ""),
+            str(record.get("insider_date") or ""),
+            int(record.get("shares") or 0),
+        )
+        if OPTIONS_NOISE_PATTERN.search(transaction_type):
+            record["filter_reason"] = "options_noise"
+        elif (
+            group_key in option_groups
+            and str(record.get("direction")) == "sell"
+        ):
+            record["filter_reason"] = "paired_with_option_activity"
+        else:
+            record["filter_reason"] = filter_reason
+    return records
+
+
+def make_trade_id(parts: list[str]) -> str:
+    raw = "|".join(parts)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{parts[0]}-{parts[1]}-{digest}"
 
 # --------------------------------------------------
 # 1. Scrape insider transactions from Finviz
@@ -133,6 +233,7 @@ def infer_direction(txn: str) -> str | None:
 def fetch_insider_trades() -> pd.DataFrame:
     base_url = 'https://finviz.com/insidertrading.ashx'
     all_records = []
+    current_page = 1
     current_url = base_url
     while True:
         log.info(f"Fetching insider trades from: {current_url}")
@@ -177,23 +278,47 @@ def fetch_insider_trades() -> pd.DataFrame:
                 cost_raw = tds[header_map['cost']].text.strip()
                 shares_raw = tds[header_map['shares']].text.strip()
                 owner = tds[header_map.get('owner', header_map.get('insidername', -1))].text.strip()
+                relationship_idx = header_map.get('relationship', -1)
+                relationship = tds[relationship_idx].text.strip() if relationship_idx >= 0 else None
+                value_idx = header_map.get('value', header_map.get('valueusd', -1))
+                value_raw = tds[value_idx].text.strip() if value_idx >= 0 else None
                 direction = infer_direction(transaction)
-                if direction is None:
-                    continue
                 cost = float(cost_raw.replace(',', ''))
                 shares = int(shares_raw.replace(',', ''))
                 date = parse_finviz_date(date_raw)
                 if cost == 0 or not date:
                     continue
-                trade_id = f"{date.isoformat()}-{ticker}-{direction}-{shares}"
+                value_usd = None
+                if value_raw:
+                    value_usd = float(value_raw.replace(',', '').replace('$', ''))
+                if value_usd is None:
+                    value_usd = float(cost * shares)
+                trade_id = make_trade_id(
+                    [
+                        date.isoformat(),
+                        ticker,
+                        owner,
+                        relationship or "",
+                        transaction,
+                        str(cost),
+                        str(shares),
+                    ]
+                )
                 all_records.append(
                     {
                         'trade_id': trade_id,
                         'ticker': ticker,
                         'direction': direction,
+                        'transaction_type': transaction,
                         'cost': cost,
+                        'shares': shares,
+                        'value_usd': value_usd,
                         'insider_date': date,
                         'insider': owner,
+                        'relationship': relationship,
+                        'source_url': current_url,
+                        'source_page': current_page,
+                        'filter_reason': None,
                     }
                 )
             except (ValueError, KeyError, IndexError) as e:
@@ -203,11 +328,13 @@ def fetch_insider_trades() -> pd.DataFrame:
         next_link = soup.find('a', string='next')
         if next_link and next_link.get('href'):
             current_url = 'https://finviz.com/' + next_link.get('href')
+            current_page += 1
             time.sleep(1)
         else:
             log.info("No 'next' page link found. Scrape complete.")
             break
 
+    all_records = classify_options_noise(all_records)
     return pd.DataFrame(all_records)
 
 # --------------------------------------------------
@@ -217,40 +344,24 @@ def fetch_insider_trades() -> pd.DataFrame:
 
 def refresh_trade_history_metrics() -> None:
     try:
-        if not TRADE_HISTORY_CSV.exists():
-            RUNTIME_STATE.set_trade_history_rows(0)
-            return
-        df = pd.read_csv(TRADE_HISTORY_CSV)
-        RUNTIME_STATE.set_trade_history_rows(len(df.index))
-    except pd.errors.EmptyDataError:
-        RUNTIME_STATE.set_trade_history_rows(0)
+        STORAGE.export_legacy_files()
+        refresh_runtime_views()
     except Exception as exc:
-        log.warning(f"Could not refresh trade history metrics: {exc}")
+        log.warning(f"Could not refresh storage-backed metrics: {exc}")
 
 
 def load_seen_trade_ids() -> set:
-    if not SEEN_TRADES_LOG.exists():
-        return set()
-    with open(SEEN_TRADES_LOG, 'r', encoding='utf-8') as f:
-        return {line.strip() for line in f}
+    return STORAGE.load_seen_trade_ids()
 
 def log_trades_as_seen(new_trade_ids: list):
-    with open(SEEN_TRADES_LOG, 'a', encoding='utf-8') as f:
-        for trade_id in new_trade_ids:
-            f.write(f"{trade_id}\n")
-    log.info(f"Logged {len(new_trade_ids)} new trades to {SEEN_TRADES_LOG}")
+    for trade_id in new_trade_ids:
+        STORAGE.mark_trade_seen(trade_id)
+    log.info(f"Logged {len(new_trade_ids)} new trades to SQLite seen state.")
 
 def load_trade_history() -> pd.DataFrame:
-    if not TRADE_HISTORY_CSV.exists():
-        RUNTIME_STATE.set_trade_history_rows(0)
-        return pd.DataFrame(columns=['trade_id'])
-    try:
-        df = pd.read_csv(TRADE_HISTORY_CSV)
-        RUNTIME_STATE.set_trade_history_rows(len(df.index))
-        return df
-    except pd.errors.EmptyDataError:
-        RUNTIME_STATE.set_trade_history_rows(0)
-        return pd.DataFrame(columns=['trade_id'])
+    df = STORAGE.get_trade_history_df()
+    RUNTIME_STATE.set_trade_history_rows(len(df.index))
+    return df
 
 def log_trade_to_history(
     trade_details,
@@ -280,39 +391,15 @@ def log_trade_to_history(
         'alpaca_order_id': order_obj.id, 'status': order_obj.status, 'exit_reason': None,
         'exit_timestamp_utc': None
     }
-    file_exists = TRADE_HISTORY_CSV.exists()
-    df = pd.DataFrame([record])
-    df.to_csv(TRADE_HISTORY_CSV, mode='a', header=not file_exists, index=False)
-    log.info(f"Successfully logged trade execution {record['trade_id']} to {TRADE_HISTORY_CSV}")
-    refresh_trade_history_metrics()
+    STORAGE.record_trade_execution(trade_info, order_obj, entry_price, tp_price, sl_price)
+    log.info(f"Successfully logged trade execution {record['trade_id']} to SQLite trade history.")
+    refresh_runtime_views()
 
 
-def update_trade_exit_in_history(symbol: str, exit_reason: str):
-    if not TRADE_HISTORY_CSV.exists():
-        return
-    try:
-        df = pd.read_csv(TRADE_HISTORY_CSV)
-    except pd.errors.EmptyDataError:
-        return
-
-    if df.empty or 'ticker' not in df.columns:
-        return
-
-    if 'exit_reason' not in df.columns:
-        df['exit_reason'] = None
-    if 'exit_timestamp_utc' not in df.columns:
-        df['exit_timestamp_utc'] = None
-
-    mask = df['ticker'] == symbol
-    if not mask.any():
-        return
-
-    idx = df[mask].index[-1]
-    df.loc[idx, 'exit_reason'] = exit_reason
-    df.loc[idx, 'exit_timestamp_utc'] = datetime.datetime.utcnow().isoformat()
-    df.to_csv(TRADE_HISTORY_CSV, index=False)
+def update_trade_exit_in_history(symbol: str, exit_reason: str, exit_price: float | None = None):
+    STORAGE.update_trade_exit(symbol, exit_reason, exit_price)
     log.info(f"Updated trade history for {symbol} with exit reason '{exit_reason}'.")
-    RUNTIME_STATE.set_trade_history_rows(len(df.index))
+    refresh_runtime_views()
 
 
 def ensure_pending_structure(data: dict | None) -> dict:
@@ -324,33 +411,18 @@ def ensure_pending_structure(data: dict | None) -> dict:
 
 
 def load_pending_orders() -> dict:
-    if not PENDING_ORDERS_JSON.exists():
-        empty_queue = {'buy': [], 'sell': []}
-        RUNTIME_STATE.update_pending_orders(empty_queue)
-        return empty_queue
-    try:
-        with open(PENDING_ORDERS_JSON, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        log.error(f"Could not read {PENDING_ORDERS_JSON}: {e}. Starting with empty queue.")
-        empty_queue = {'buy': [], 'sell': []}
-        RUNTIME_STATE.update_pending_orders(empty_queue)
-        return empty_queue
-    normalized = ensure_pending_structure(data)
-    RUNTIME_STATE.update_pending_orders(normalized)
-    return normalized
+    pending = ensure_pending_structure(STORAGE.load_pending_orders())
+    RUNTIME_STATE.update_pending_orders(STORAGE.get_pending_summary())
+    return pending
 
 
 def save_pending_orders(pending_orders: dict):
-    data = ensure_pending_structure(pending_orders)
-    with open(PENDING_ORDERS_JSON, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-    log.info(f"Persisted pending orders queue to {PENDING_ORDERS_JSON}.")
-    RUNTIME_STATE.update_pending_orders(data)
+    STORAGE.export_legacy_files()
+    log.info(f"Persisted pending orders queue to {STATE_DB_PATH}.")
+    refresh_runtime_views()
 
 
 def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
-    pending = ensure_pending_structure(pending_orders)
     trade_info = trade_details.to_dict() if isinstance(trade_details, pd.Series) else dict(trade_details)
     trade_id = trade_info.get('trade_id')
     ticker = trade_info.get('ticker')
@@ -358,29 +430,20 @@ def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
         log.warning("Cannot queue trade without trade_id and ticker.")
         return False
 
-    existing_ids = {order.get('trade_id') for order in pending['buy']}
-    if trade_id in existing_ids:
+    if not STORAGE.queue_entry(trade_info):
         log.info(f"Trade {trade_id} for {ticker} is already queued for execution.")
         return False
 
-    insider_date = trade_info.get('insider_date')
-    if isinstance(insider_date, (datetime.date, datetime.datetime)):
-        insider_date_str = insider_date.isoformat()
-    elif insider_date is not None:
-        insider_date_str = str(insider_date)
-    else:
-        insider_date_str = None
-
-    pending['buy'].append({
-        'trade_id': trade_id,
-        'ticker': ticker,
-        'direction': trade_info.get('direction', 'buy'),
-        'insider_date': insider_date_str,
-        'insider': trade_info.get('insider'),
-        'queued_at_utc': datetime.datetime.utcnow().isoformat()
-    })
-    log.info(f"Queued buy order for {ticker} ({trade_id}) until market hours.")
-    RUNTIME_STATE.update_pending_orders(pending)
+    log.info(
+        "Queued %s order for %s (%s) from %s [%s | %s] until market hours.",
+        trade_info.get('direction', 'buy'),
+        ticker,
+        trade_id,
+        trade_info.get('insider') or 'unknown insider',
+        trade_info.get('relationship') or 'unknown relationship',
+        trade_info.get('transaction_type') or 'unknown transaction',
+    )
+    refresh_runtime_views()
     return True
 
 
@@ -389,20 +452,12 @@ def queue_pending_sell(pending_orders: dict, symbol: str, reason: str) -> bool:
         log.warning("Cannot queue sell order without a symbol.")
         return False
 
-    pending = ensure_pending_structure(pending_orders)
-    existing = {(order.get('symbol'), order.get('reason')) for order in pending['sell']}
-    key = (symbol, reason)
-    if key in existing:
+    if not STORAGE.queue_exit(symbol, reason):
         log.info(f"Sell order for {symbol} ({reason}) is already queued.")
         return False
 
-    pending['sell'].append({
-        'symbol': symbol,
-        'reason': reason,
-        'queued_at_utc': datetime.datetime.utcnow().isoformat()
-    })
     log.info(f"Queued sell order for {symbol} due to {reason}.")
-    RUNTIME_STATE.update_pending_orders(pending)
+    refresh_runtime_views()
     return True
 
 
@@ -416,24 +471,25 @@ def execute_pending_orders(
 
     sell_orders = pending.get('sell', [])
     if sell_orders:
-        remaining_sell_orders = []
         for order in sell_orders:
+            queue_id = order.get("queue_id")
             symbol = order.get('symbol')
             reason = order.get('reason', 'pending sell')
             if not symbol:
                 continue
+            if queue_id:
+                STORAGE.record_queue_attempt(int(queue_id))
             try:
+                exit_price = api.get_latest_trade(symbol).price
                 api.close_position(symbol)
                 log.info(f"Executed queued sell for {symbol} ({reason}).")
-                update_trade_exit_in_history(symbol, reason)
+                update_trade_exit_in_history(symbol, reason, exit_price)
+                if queue_id:
+                    STORAGE.mark_queue_executed(int(queue_id))
                 heartbeat("order", note=f"sell:{symbol}")
                 modified = True
             except Exception as e:
                 log.error(f"Failed to execute queued sell for {symbol}: {e}")
-                remaining_sell_orders.append(order)
-        pending['sell'] = remaining_sell_orders
-        if len(remaining_sell_orders) != len(sell_orders):
-            modified = True
 
     buy_orders = pending.get('buy', [])
     if buy_orders:
@@ -446,17 +502,25 @@ def execute_pending_orders(
             log.error(f"Could not refresh open positions before executing queued buys: {e}")
             open_positions = set()
 
-        remaining_buy_orders = []
         for order in buy_orders:
             trade = dict(order)
+            queue_id = trade.get("queue_id")
             symbol = trade.get('ticker')
             if not symbol:
                 log.warning("Skipping queued buy order without a ticker symbol.")
                 continue
             if symbol in open_positions:
                 log.info(f"Skipping queued buy for {symbol}: position already open.")
+                STORAGE.update_signal_status(trade.get("trade_id"), "skipped", "position already open during queued execution")
+                if trade.get("trade_id"):
+                    STORAGE.mark_trade_seen(trade["trade_id"])
+                if queue_id:
+                    STORAGE.mark_queue_executed(int(queue_id))
                 modified = True
                 continue
+
+            if queue_id:
+                STORAGE.record_queue_attempt(int(queue_id))
 
             insider_date = trade.get('insider_date')
             if isinstance(insider_date, str):
@@ -469,17 +533,13 @@ def execute_pending_orders(
             success = place_simple_market_order(api, trade, capital_per_trade_usd)
             if success:
                 open_positions.add(symbol)
+                if queue_id:
+                    STORAGE.mark_queue_executed(int(queue_id))
                 heartbeat("order", note=f"buy:{symbol}")
                 modified = True
                 time.sleep(2)
-            else:
-                remaining_buy_orders.append(order)
 
-        pending['buy'] = remaining_buy_orders
-        if len(remaining_buy_orders) != len(buy_orders):
-            modified = True
-
-    RUNTIME_STATE.update_pending_orders(pending)
+    refresh_runtime_views()
     return modified
 
 
@@ -513,15 +573,30 @@ def process_insider_trades(
         log.info("No new insider trades found since the last scan.")
         return False
 
-    log_trades_as_seen(new_unseen_trades['trade_id'].tolist())
     log.info(f"Found {len(new_unseen_trades)} new insider trades to evaluate.")
 
     queued_count = 0
     for _, trade in new_unseen_trades.iterrows():
-        ticker = trade['ticker']
-        trade_id = trade['trade_id']
+        trade_info = trade.to_dict()
+        trade_id = trade_info['trade_id']
+        ticker = trade_info['ticker']
+        STORAGE.upsert_signal(trade_info)
+
+        if trade_info.get("filter_reason"):
+            STORAGE.update_signal_status(trade_id, "filtered", trade_info["filter_reason"])
+            STORAGE.mark_trade_seen(trade_id)
+            log.info(f"Filtered {ticker} ({trade_id}) as {trade_info['filter_reason']}.")
+            continue
+
+        if trade_info.get("direction") is None:
+            STORAGE.update_signal_status(trade_id, "filtered", "unsupported transaction type")
+            STORAGE.mark_trade_seen(trade_id)
+            continue
+
         if ticker in open_positions:
             log.info(f"Skipping {ticker}: position already open.")
+            STORAGE.update_signal_status(trade_id, "skipped", "position already open")
+            STORAGE.mark_trade_seen(trade_id)
             continue
         if trade_id in pending_buy_ids:
             log.info(f"Skipping {ticker}: trade {trade_id} already queued.")
@@ -530,23 +605,26 @@ def process_insider_trades(
         if can_trade_now:
             if capital_per_trade_usd is None:
                 log.error("Capital per trade missing despite market open; cannot trade now.")
+                STORAGE.update_signal_status(trade_id, "observed", "capital unavailable")
                 heartbeat("order", ok=False, note=f"buy:{ticker}-no_capital")
                 continue
-            success = place_simple_market_order(api, trade, capital_per_trade_usd)
+            success = place_simple_market_order(api, trade_info, capital_per_trade_usd)
             if success:
                 open_positions.add(ticker)
                 heartbeat("order", note=f"buy:{ticker}")
                 time.sleep(2)
             else:
+                STORAGE.update_signal_status(trade_id, "observed", "submission failed; will retry")
                 log.error(f"Failed to submit order for {ticker} during market hours.")
         else:
-            if queue_pending_trade(pending_orders, trade):
+            if queue_pending_trade(pending_orders, trade_info):
                 pending_buy_ids.add(trade_id)
                 queued_count += 1
 
     if queued_count:
         log.info(f"Queued {queued_count} trades for the next market session.")
 
+    refresh_runtime_views()
     return queued_count > 0
 
 def place_simple_market_order(api: REST, trade_details, capital_usd: float) -> bool:
@@ -586,7 +664,15 @@ def place_simple_market_order(api: REST, trade_details, capital_usd: float) -> b
         tp_price = round(latest_price * (1 - TAKE_PROFIT_PERCENT / 100), 2)
     sl_price = None
     
-    log.info(f"Submitting {side} MARKET order for {qty} shares of {symbol}.")
+    log.info(
+        "Submitting %s MARKET order for %s shares of %s from %s [%s | %s].",
+        side,
+        qty,
+        symbol,
+        trade_info.get('insider') or 'unknown insider',
+        trade_info.get('relationship') or 'unknown relationship',
+        trade_info.get('transaction_type') or 'unknown transaction',
+    )
     try:
         # --- PLAN A: Submit the order as calculated ---
         order = api.submit_order(symbol=symbol, qty=qty, side=side, type='market', time_in_force='day')
@@ -655,7 +741,7 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame, is_mar
                     try:
                         api.close_position(pos.symbol)
                         log.info(f"Closed {pos.symbol} due to {exit_reason}.")
-                        update_trade_exit_in_history(pos.symbol, exit_reason)
+                        update_trade_exit_in_history(pos.symbol, exit_reason, current_price)
                         heartbeat("order", note=f"exit:{pos.symbol}")
                         pending_modified = True
                     except Exception as e:
@@ -676,7 +762,9 @@ def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame, is_mar
 # 3. Main Execution Loop
 # --------------------------------------------------
 if __name__ == '__main__':
+    STORAGE.initialize()
     refresh_trade_history_metrics()
+    refresh_runtime_views()
     if CONFIG.monitoring_enabled:
         try:
             start_monitoring_server(
@@ -703,6 +791,7 @@ if __name__ == '__main__':
 
     log.info("--- Starting Continuous Insider Trading Bot with Smart Error Handling ---")
     log.info("State directory: %s", CONFIG.state_dir)
+    log.info("SQLite state DB: %s", STATE_DB_PATH)
     log.info("Trade history file: %s", TRADE_HISTORY_CSV)
     log.info("Pending orders file: %s", PENDING_ORDERS_JSON)
 
@@ -715,11 +804,13 @@ if __name__ == '__main__':
         pending_orders = load_pending_orders()
         pending_modified = False
         is_market_open = False
+        next_open_at: datetime.datetime | None = None
 
         try:
             try:
                 clock = api.get_clock()
                 is_market_open = clock.is_open
+                next_open_at = normalize_utc_datetime(getattr(clock, "next_open", None))
                 RUNTIME_STATE.set_market_open(is_market_open)
                 log.info(f"Market open status: {is_market_open}")
                 heartbeat("alpaca_clock", note="open" if is_market_open else "closed")
@@ -764,7 +855,8 @@ if __name__ == '__main__':
                     heartbeat("pending_orders", note="market_closed")
 
             ran_insider_scan = False
-            if (cycle_start - last_insider_scan) >= datetime.timedelta(minutes=INSIDER_SCAN_INTERVAL_MINUTES):
+            insider_scan_interval_minutes = effective_insider_scan_interval_minutes(is_market_open)
+            if (cycle_start - last_insider_scan) >= datetime.timedelta(minutes=insider_scan_interval_minutes):
                 ran_insider_scan = True
                 try:
                     if process_insider_trades(api, is_market_open, pending_orders, capital_per_trade_usd):
@@ -778,7 +870,8 @@ if __name__ == '__main__':
                 heartbeat("scrape", note="skipped_interval")
 
             run_position_check = is_market_open and (
-                (cycle_start - last_position_check) >= datetime.timedelta(minutes=POSITION_CHECK_INTERVAL_MINUTES)
+                (cycle_start - last_position_check)
+                >= datetime.timedelta(minutes=effective_position_check_interval_minutes())
             )
             if run_position_check:
                 try:
@@ -808,10 +901,13 @@ if __name__ == '__main__':
         if pending_modified:
             save_pending_orders(pending_orders)
         else:
-            RUNTIME_STATE.update_pending_orders(pending_orders)
+            refresh_runtime_views()
 
-        sleep_seconds = (
-            MARKET_OPEN_POLL_SECONDS if is_market_open else MARKET_CLOSED_POLL_SECONDS
+        pending_orders = load_pending_orders()
+        sleep_seconds = compute_sleep_seconds(
+            is_market_open=is_market_open,
+            pending_orders=pending_orders,
+            next_open_at=next_open_at,
         )
         market_state = "open" if is_market_open else "closed"
         log.info(

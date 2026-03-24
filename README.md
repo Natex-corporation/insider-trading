@@ -12,7 +12,7 @@ At a high level, the bot does this in a loop:
 4. Ignores signals it has already processed.
 5. Places a market order in Alpaca when the market is open, or queues it for later.
 6. Tracks open positions and closes them when the configured take-profit target is reached.
-7. Writes trade history, queue state, logs, and heartbeat data to disk.
+7. Writes state into SQLite and exports compatibility files for easy inspection.
 
 ## What It Actually Trades
 
@@ -32,9 +32,10 @@ This means it is closer to an automation prototype than a production trading sys
 
 By default, the bot writes state into the repository directory. In the container setup, it writes to `/data`.
 
-- `trade_history.csv`: submitted orders and recorded exits.
-- `seen_insider_trades.log`: signal IDs already processed.
-- `pending_orders.json`: orders queued until the market reopens.
+- `insider_trading.sqlite3`: primary application database.
+- `trade_history.csv`: exported trade history snapshot.
+- `seen_insider_trades.log`: exported seen-signal snapshot.
+- `pending_orders.json`: exported queue snapshot, now including `entries` and `exits`.
 - `heartbeat.txt`: loop and stage heartbeat log.
 - `app.log`: rotating application log file.
 
@@ -48,7 +49,7 @@ The bot now exposes a lightweight monitoring server. By default it listens on po
 - `/status`: JSON snapshot of the bot state.
 - `/metrics`: Prometheus-style text metrics.
 
-The Docker image uses `scripts/healthcheck.py`, which checks `/healthz` and marks the container unhealthy if the bot stops heartbeating.
+The status page now also shows queued orders and a simple insider-performance leaderboard based on recorded trade outcomes.
 
 ## Configuration
 
@@ -64,12 +65,13 @@ Common optional settings:
 - `ALPACA_BASE_URL` default: `https://paper-api.alpaca.markets`
 - `TRADE_CAPITAL_CZK` default: `250`
 - `TAKE_PROFIT_PERCENT` default: `10`
-- `INSIDER_SCAN_INTERVAL_MINUTES` default: `15`
-- `POSITION_CHECK_INTERVAL_MINUTES` default: `5`
-- `MARKET_OPEN_POLL_SECONDS` default: `60`
-- `MARKET_CLOSED_POLL_SECONDS` default: `900`
+- `INSIDER_SCAN_INTERVAL_MINUTES` default: `5`
+- `POSITION_CHECK_INTERVAL_MINUTES` default: `2`
+- `MARKET_OPEN_POLL_SECONDS` default: `30`
+- `MARKET_CLOSED_POLL_SECONDS` default: `300`
 - `STATE_DIR` default: repository directory
 - `LOG_DIR` default: repository directory
+- `SQLITE_DB_PATH` default: `insider_trading.sqlite3` inside the state directory
 - `MONITORING_ENABLED` default: `true`
 - `MONITORING_PORT` default: `8080`
 
@@ -141,6 +143,7 @@ The old LXC/systemd helper is still present in [scripts/setup_lxc.sh](scripts/se
 - [scripts/render_truenas_compose.py](scripts/render_truenas_compose.py): generates a TrueNAS-ready custom-app YAML
 - [config.py](config.py): environment-driven config loader
 - [monitoring.py](monitoring.py): health, status, and metrics server
+- [storage.py](storage.py): SQLite-backed state, queue, and insider analytics
 
 ## Disclaimer
 

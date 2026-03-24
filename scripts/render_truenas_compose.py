@@ -45,6 +45,7 @@ def build_yaml(
       MARKET_CLOSED_POLL_SECONDS: "{market_closed_poll_seconds}"
       STATE_DIR: "/data"
       LOG_DIR: "/data/logs"
+      SQLITE_DB_PATH: "/data/insider_trading.sqlite3"
       MONITORING_ENABLED: "true"
       MONITORING_HOST: "0.0.0.0"
       MONITORING_PORT: "8080"
@@ -102,23 +103,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--insider-scan-interval-minutes",
-        default=_env_or_default("INSIDER_SCAN_INTERVAL_MINUTES", "15"),
-        help="How often to scrape Finviz. Default: 15",
+        default=_env_or_default("INSIDER_SCAN_INTERVAL_MINUTES", "5"),
+        help="How often to scrape Finviz. Default: 5",
     )
     parser.add_argument(
         "--position-check-interval-minutes",
-        default=_env_or_default("POSITION_CHECK_INTERVAL_MINUTES", "5"),
-        help="How often to evaluate exits during market hours. Default: 5",
+        default=_env_or_default("POSITION_CHECK_INTERVAL_MINUTES", "2"),
+        help="How often to evaluate exits during market hours. Default: 2",
     )
     parser.add_argument(
         "--market-open-poll-seconds",
-        default=_env_or_default("MARKET_OPEN_POLL_SECONDS", "60"),
-        help="Loop sleep while the market is open. Default: 60",
+        default=_env_or_default("MARKET_OPEN_POLL_SECONDS", "30"),
+        help="Loop sleep while the market is open. Default: 30",
     )
     parser.add_argument(
         "--market-closed-poll-seconds",
-        default=_env_or_default("MARKET_CLOSED_POLL_SECONDS", "900"),
-        help="Loop sleep while the market is closed. Default: 900",
+        default=_env_or_default("MARKET_CLOSED_POLL_SECONDS", "300"),
+        help="Loop sleep while the market is closed. Default: 300",
     )
     return parser.parse_args()
 

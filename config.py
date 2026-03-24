@@ -53,6 +53,7 @@ class AppConfig:
     request_timeout: tuple[int, int]
     state_dir: Path
     log_dir: Path
+    sqlite_db_path: Path
     heartbeat_file: Path
     app_log_file: Path
     trade_history_csv: Path
@@ -83,9 +84,9 @@ def load_config() -> AppConfig:
     log_dir = _resolve_path(_env_str("LOG_DIR", "."), state_dir)
 
     trade_capital_czk = _env_float("TRADE_CAPITAL_CZK", 250.0)
-    insider_scan_interval_minutes = _env_int("INSIDER_SCAN_INTERVAL_MINUTES", 15)
-    position_check_interval_minutes = _env_int("POSITION_CHECK_INTERVAL_MINUTES", 5)
-    market_open_poll_seconds = _env_int("MARKET_OPEN_POLL_SECONDS", 60)
+    insider_scan_interval_minutes = _env_int("INSIDER_SCAN_INTERVAL_MINUTES", 5)
+    position_check_interval_minutes = _env_int("POSITION_CHECK_INTERVAL_MINUTES", 2)
+    market_open_poll_seconds = _env_int("MARKET_OPEN_POLL_SECONDS", 30)
     market_closed_poll_seconds = _env_int(
         "MARKET_CLOSED_POLL_SECONDS",
         insider_scan_interval_minutes * 60,
@@ -100,6 +101,7 @@ def load_config() -> AppConfig:
         request_timeout=request_timeout,
         state_dir=state_dir,
         log_dir=log_dir,
+        sqlite_db_path=_resolve_path(_env_str("SQLITE_DB_PATH", "insider_trading.sqlite3"), state_dir),
         heartbeat_file=_resolve_path(_env_str("HEARTBEAT_FILE", "heartbeat.txt"), state_dir),
         app_log_file=_resolve_path(_env_str("APP_LOG_FILE", "app.log"), log_dir),
         trade_history_csv=_resolve_path(_env_str("TRADE_HISTORY_CSV", "trade_history.csv"), state_dir),
@@ -128,6 +130,7 @@ def load_config() -> AppConfig:
     for directory in {
         config.state_dir,
         config.log_dir,
+        config.sqlite_db_path.parent,
         config.heartbeat_file.parent,
         config.app_log_file.parent,
         config.trade_history_csv.parent,

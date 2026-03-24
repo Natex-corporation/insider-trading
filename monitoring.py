@@ -31,6 +31,8 @@ class RuntimeState:
         self._trade_history_rows = 0
         self._market_open: bool | None = None
         self._latest_scrape_rows = 0
+        self._queue_preview: list[dict[str, Any]] = []
+        self._insider_leaderboard: list[dict[str, Any]] = []
 
     def record_heartbeat(self, stage: str, ok: bool = True, note: str = "") -> None:
         now = _utc_now()
@@ -44,14 +46,16 @@ class RuntimeState:
             }
 
     def update_pending_orders(self, pending_orders: dict | None) -> None:
-        buy_orders = []
-        sell_orders = []
+        buy_count = 0
+        sell_count = 0
         if isinstance(pending_orders, dict):
             buy_orders = pending_orders.get("buy") or []
             sell_orders = pending_orders.get("sell") or []
+            buy_count = buy_orders if isinstance(buy_orders, int) else len(buy_orders)
+            sell_count = sell_orders if isinstance(sell_orders, int) else len(sell_orders)
         with self._lock:
-            self._pending_buy_count = len(buy_orders)
-            self._pending_sell_count = len(sell_orders)
+            self._pending_buy_count = int(buy_count)
+            self._pending_sell_count = int(sell_count)
 
     def set_trade_history_rows(self, rows: int) -> None:
         with self._lock:
@@ -64,6 +68,14 @@ class RuntimeState:
     def set_latest_scrape_rows(self, rows: int) -> None:
         with self._lock:
             self._latest_scrape_rows = max(0, int(rows))
+
+    def set_queue_preview(self, rows: list[dict[str, Any]]) -> None:
+        with self._lock:
+            self._queue_preview = list(rows)
+
+    def set_insider_leaderboard(self, rows: list[dict[str, Any]]) -> None:
+        with self._lock:
+            self._insider_leaderboard = list(rows)
 
     def _health(self) -> tuple[bool, str, float | None]:
         now = _utc_now()
@@ -100,6 +112,8 @@ class RuntimeState:
                     "sell": self._pending_sell_count,
                 },
                 "trade_history_rows": self._trade_history_rows,
+                "queue_preview": list(self._queue_preview),
+                "insider_leaderboard": list(self._insider_leaderboard),
                 "stages": stages,
             }
 
@@ -161,6 +175,31 @@ def _render_html(snapshot: dict[str, Any]) -> str:
         )
         for name, data in snapshot["stages"].items()
     )
+    queue_rows = "\n".join(
+        (
+            "<tr>"
+            f"<td>{html.escape(str(item.get('queue_kind', '-')))}</td>"
+            f"<td>{html.escape(str(item.get('side', '-')))}</td>"
+            f"<td>{html.escape(str(item.get('symbol', '-')))}</td>"
+            f"<td>{html.escape(str(item.get('reason', '-')))}</td>"
+            f"<td>{html.escape(str(item.get('queued_at_utc', '-')))}</td>"
+            "</tr>"
+        )
+        for item in snapshot.get("queue_preview", [])
+    ) or "<tr><td colspan='5'>No queued orders</td></tr>"
+    leaderboard_rows = "\n".join(
+        (
+            "<tr>"
+            f"<td>{html.escape(str(item.get('insider_name', '-')))}</td>"
+            f"<td>{html.escape(str(item.get('insider_relationship', '-')))}</td>"
+            f"<td>{html.escape(str(item.get('total_trades', 0)))}</td>"
+            f"<td>{html.escape(str(item.get('closed_trades', 0)))}</td>"
+            f"<td>{html.escape(str(item.get('winning_trades', 0)))}</td>"
+            f"<td>{html.escape(str(item.get('avg_return_pct', '-')))}</td>"
+            "</tr>"
+        )
+        for item in snapshot.get("insider_leaderboard", [])
+    ) or "<tr><td colspan='6'>No insider stats yet</td></tr>"
     market_open = snapshot["market_open"]
     market_text = "unknown" if market_open is None else ("open" if market_open else "closed")
     healthy_text = "healthy" if snapshot["healthy"] else "unhealthy"
@@ -223,6 +262,28 @@ def _render_html(snapshot: dict[str, Any]) -> str:
       </thead>
       <tbody>
         {stage_rows}
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Pending Queue</h2>
+    <table>
+      <thead>
+        <tr><th>Kind</th><th>Side</th><th>Symbol</th><th>Reason</th><th>Queued</th></tr>
+      </thead>
+      <tbody>
+        {queue_rows}
+      </tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Insider Leaderboard</h2>
+    <table>
+      <thead>
+        <tr><th>Insider</th><th>Relationship</th><th>Total</th><th>Closed</th><th>Wins</th><th>Avg Return %</th></tr>
+      </thead>
+      <tbody>
+        {leaderboard_rows}
       </tbody>
     </table>
   </div>

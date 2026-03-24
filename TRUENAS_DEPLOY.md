@@ -87,6 +87,7 @@ Expected endpoints:
 
 Expected persisted files in the mounted dataset:
 
+- `insider_trading.sqlite3`
 - `trade_history.csv`
 - `pending_orders.json`
 - `seen_insider_trades.log`

@@ -20,7 +20,7 @@ The strategy is intentionally simple:
 
 - It uses a fixed per-trade budget in CZK (`TRADE_CAPITAL_CZK`, default `250`).
 - It converts that budget to USD each cycle.
-- It buys or sells based only on the Finviz transaction label.
+- It starts from the Finviz transaction label, then checks the company's quote-page insider table so a small insider sell does not immediately flip a stronger recent buy trend into a short.
 - It uses a take-profit target (`TAKE_PROFIT_PERCENT`, default `10`).
 - It does not use a stop loss.
 - It does not score insider quality, company quality, liquidity, or risk.

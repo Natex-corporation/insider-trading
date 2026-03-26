@@ -105,6 +105,10 @@ OPTIONS_NOISE_PATTERN = re.compile(
     r"(option|exercise|derivative|convert|conversion|grant|award)",
     re.IGNORECASE,
 )
+PROPOSED_TRANSACTION_PATTERN = re.compile(r"proposed", re.IGNORECASE)
+COMPANY_HISTORY_ROW_LIMIT = 12
+COMPANY_TREND_DOMINANCE_RATIO = 1.5
+PROPOSED_TRANSACTION_WEIGHT = 0.25
 STORAGE = Storage(
     db_path=STATE_DB_PATH,
     trade_history_csv=TRADE_HISTORY_CSV,
@@ -185,6 +189,137 @@ def infer_direction(txn: str) -> str | None:
     if 'buy' in lower: return 'buy'
     if 'sell' in lower or 'sale' in lower: return 'sell'
     return None
+
+
+def parse_numeric_text(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    cleaned = str(raw).replace(",", "").replace("$", "").strip()
+    if cleaned in {"", "-", "None", "nan"}:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def signal_weight_for_transaction(transaction: str) -> float:
+    return PROPOSED_TRANSACTION_WEIGHT if PROPOSED_TRANSACTION_PATTERN.search(transaction) else 1.0
+
+
+def fetch_company_insider_activity(ticker: str) -> list[dict]:
+    company_url = f"https://finviz.com/quote.ashx?t={ticker}"
+    try:
+        resp = SESSION.get(company_url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.warning(f"Could not fetch company insider activity for {ticker}: {exc}")
+        return []
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    rows = []
+    for tr in soup.select("tr.fv-insider-row"):
+        tds = tr.find_all("td")
+        if len(tds) < 7:
+            continue
+
+        owner = tds[0].get_text(" ", strip=True)
+        relationship = tds[1].get_text(" ", strip=True) or None
+        date_raw = tds[2].get_text(" ", strip=True)
+        transaction = tds[3].get_text(" ", strip=True)
+        cost = parse_numeric_text(tds[4].get_text(" ", strip=True))
+        shares_value = parse_numeric_text(tds[5].get_text(" ", strip=True))
+        value_usd = parse_numeric_text(tds[6].get_text(" ", strip=True))
+        date = parse_finviz_date(date_raw)
+        direction = infer_direction(transaction)
+
+        if date is None or direction is None or OPTIONS_NOISE_PATTERN.search(transaction):
+            continue
+
+        shares = int(shares_value) if shares_value is not None else 0
+        if value_usd is None and cost is not None and shares > 0:
+            value_usd = cost * shares
+        if value_usd is None or value_usd <= 0:
+            continue
+
+        rows.append(
+            {
+                "trade_id": make_trade_id(
+                    [
+                        date.isoformat(),
+                        ticker,
+                        owner,
+                        relationship or "",
+                        transaction,
+                        str(cost),
+                        str(shares),
+                    ]
+                ),
+                "direction": direction,
+                "transaction_type": transaction,
+                "value_usd": value_usd,
+                "weighted_value_usd": value_usd * signal_weight_for_transaction(transaction),
+            }
+        )
+    return rows
+
+
+def resolve_direction_with_company_history(
+    trade_details,
+    company_history_cache: dict[str, list[dict]],
+):
+    trade_info = trade_details.to_dict() if isinstance(trade_details, pd.Series) else dict(trade_details)
+    ticker = trade_info.get("ticker")
+    direction = trade_info.get("direction")
+    if not ticker or direction != "sell":
+        return trade_info
+
+    company_history = company_history_cache.get(ticker)
+    if company_history is None:
+        company_history = fetch_company_insider_activity(ticker)
+        company_history_cache[ticker] = company_history
+    if not company_history:
+        return trade_info
+
+    history_rows = [row for row in company_history if row.get("trade_id") != trade_info.get("trade_id")]
+    if not history_rows:
+        return trade_info
+
+    recent_rows = history_rows[:COMPANY_HISTORY_ROW_LIMIT]
+    buy_strength = sum(row["weighted_value_usd"] for row in recent_rows if row["direction"] == "buy")
+    sell_strength = sum(row["weighted_value_usd"] for row in recent_rows if row["direction"] == "sell")
+    if buy_strength <= 0 and sell_strength <= 0:
+        return trade_info
+
+    if buy_strength <= sell_strength:
+        return trade_info
+
+    if sell_strength > 0 and (buy_strength / sell_strength) < COMPANY_TREND_DOMINANCE_RATIO:
+        return trade_info
+
+    current_value = parse_numeric_text(str(trade_info.get("value_usd") or ""))
+    current_strength = (current_value or 0.0) * signal_weight_for_transaction(
+        str(trade_info.get("transaction_type") or "")
+    )
+    current_side_history = sell_strength
+    opposing_history = buy_strength
+    projected_current_strength = current_side_history + current_strength
+    if projected_current_strength >= opposing_history:
+        return trade_info
+
+    trade_info["direction"] = "buy"
+    log.info(
+        "Adjusted %s signal for %s from %s to %s using company insider history "
+        "(buy_strength=$%.0f, sell_strength=$%.0f, current_strength=$%.0f).",
+        trade_info.get("trade_id"),
+        ticker,
+        direction,
+        "buy",
+        buy_strength,
+        sell_strength,
+        current_strength,
+    )
+    return trade_info
 
 
 def classify_options_noise(records: list[dict]) -> list[dict]:
@@ -283,14 +418,15 @@ def fetch_insider_trades() -> pd.DataFrame:
                 value_idx = header_map.get('value', header_map.get('valueusd', -1))
                 value_raw = tds[value_idx].text.strip() if value_idx >= 0 else None
                 direction = infer_direction(transaction)
-                cost = float(cost_raw.replace(',', ''))
-                shares = int(shares_raw.replace(',', ''))
+                cost = parse_numeric_text(cost_raw)
+                shares_value = parse_numeric_text(shares_raw)
                 date = parse_finviz_date(date_raw)
-                if cost == 0 or not date:
+                if cost in (None, 0) or not date or shares_value is None:
                     continue
+                shares = int(shares_value)
                 value_usd = None
                 if value_raw:
-                    value_usd = float(value_raw.replace(',', '').replace('$', ''))
+                    value_usd = parse_numeric_text(value_raw)
                 if value_usd is None:
                     value_usd = float(cost * shares)
                 trade_id = make_trade_id(
@@ -551,6 +687,7 @@ def process_insider_trades(
 ) -> bool:
     pending = ensure_pending_structure(pending_orders)
     pending_buy_ids = {order.get('trade_id') for order in pending['buy']}
+    company_history_cache: dict[str, list[dict]] = {}
 
     try:
         open_positions = {p.symbol for p in api.list_positions()}
@@ -578,6 +715,8 @@ def process_insider_trades(
     queued_count = 0
     for _, trade in new_unseen_trades.iterrows():
         trade_info = trade.to_dict()
+        if not trade_info.get("filter_reason"):
+            trade_info = resolve_direction_with_company_history(trade_info, company_history_cache)
         trade_id = trade_info['trade_id']
         ticker = trade_info['ticker']
         STORAGE.upsert_signal(trade_info)

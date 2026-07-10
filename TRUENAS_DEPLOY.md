@@ -13,6 +13,7 @@ You still need three things that cannot be completed safely from this machine:
 1. fresh Alpaca paper-trading credentials
 2. a TrueNAS dataset path such as `/mnt/tank/apps/insider-trading`
 3. a push to GitHub so the image is published to GHCR
+4. dataset permissions that allow container UID/GID `10001` to write under `/data`
 
 ## What Is Already Prepared
 
@@ -34,6 +35,9 @@ python scripts/render_truenas_compose.py
 ```
 
 That writes `truenas-compose.generated.yaml`.
+
+The generated file contains credentials and is created with restrictive permissions where supported. It is excluded
+from Git and Docker build contexts. Keep it private and delete it after installing the app if practical.
 
 On PowerShell:
 
@@ -75,6 +79,7 @@ If the package is private, add GHCR registry credentials in TrueNAS first. If po
 4. Paste the contents of `truenas-compose.generated.yaml`.
 5. Save and wait for the app to start.
 6. Open `http://<truenas-ip>:8080/` to view bot status.
+7. Confirm the dashboard says `Dry run` and `Paper` before setting `DRY_RUN=false`.
 
 ## Check The Deployment
 

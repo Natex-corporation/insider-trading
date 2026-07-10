@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import load_config
+from config import load_config  # noqa: E402
 
 
 def main() -> int:
@@ -26,9 +26,7 @@ def main() -> int:
     if not config.heartbeat_file.exists():
         return 1
 
-    heartbeat_age_seconds = (
-        __import__("time").time() - config.heartbeat_file.stat().st_mtime
-    )
+    heartbeat_age_seconds = __import__("time").time() - config.heartbeat_file.stat().st_mtime
     return 0 if heartbeat_age_seconds <= config.health_max_age_seconds else 1
 
 

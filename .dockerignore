@@ -12,3 +12,8 @@ heartbeat.txt
 pending_orders.json
 seen_insider_trades.log
 trade_history.csv
+truenas-compose.generated.yaml
+tests
+requirements-dev.txt
+.pytest_cache
+.ruff_cache

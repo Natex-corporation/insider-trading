@@ -1,150 +1,166 @@
-# Insider Trading Bot
+# Insider Edge
 
-This repository contains a long-running Python bot that watches recent insider trades on [Finviz](https://finviz.com/insidertrading.ashx) and mirrors them into an Alpaca paper-trading account.
+Insider Edge is a safety-first Python service that watches recent insider transactions on
+[Finviz](https://finviz.com/insidertrading.ashx), converts eligible activity into trade signals, and can mirror
+those signals into an Alpaca paper-trading account.
 
-## What This Project Is
+It is an experimental strategy and operations dashboard, not evidence of a profitable system. Keep it in dry-run
+or paper mode until its behavior and results are satisfactory.
 
-At a high level, the bot does this in a loop:
+## What it does
 
-1. Checks whether the US market is open through Alpaca.
-2. Fetches the latest insider-trading table from Finviz.
-3. Converts each row into a simple trade signal (`buy` or `sell`).
-4. Ignores signals it has already processed.
-5. Places a market order in Alpaca when the market is open, or queues it for later.
-6. Tracks open positions and closes them when the configured take-profit target is reached.
-7. Writes state into SQLite and exports compatibility files for easy inspection.
+1. Reads the Alpaca market clock, account restrictions, buying power, assets, orders, and positions.
+2. Scrapes only a bounded number of recent Finviz pages and rejects stale signals.
+3. Filters option-related activity and optionally checks recent company-level insider direction.
+4. Applies portfolio, daily-entry, shortability, signal-age, and exposure checks.
+5. Submits deterministic client order IDs and reconciles orders to actual fills.
+6. Manages only the quantity opened by this bot using take-profit, stop-loss, or maximum-hold exits.
+7. Stores signals, queues, orders, fills, exits, and performance in SQLite.
+8. Shows account performance against buy-and-hold SPY, risk usage, swing/day activity, and system health.
 
-## What It Actually Trades
+## Safety defaults
 
-The strategy is intentionally simple:
+- `DRY_RUN=true`: signals are evaluated and reported, but no orders are submitted.
+- Paper endpoint required unless `ALLOW_LIVE_TRADING=true` is explicitly set.
+- `ALLOW_SHORTING=false`: an insider sale does not automatically create a short position.
+- A fresh state directory records the first scrape as a baseline without trading it.
+- Signals older than `SIGNAL_MAX_AGE_HOURS` are not considered.
+- New entries stop when position, daily-entry, exposure, buying-power, or broker restrictions are reached.
+- Failed queue entries use exponential backoff and become terminal after an attempt or age limit.
+- If Alpaca account or position state cannot be verified, new entries and managed exits pause.
 
-- It uses a fixed per-trade budget in CZK (`TRADE_CAPITAL_CZK`, default `250`).
-- It converts that budget to USD each cycle.
-- It starts from the Finviz transaction label, then checks the company's quote-page insider table so a small insider sell does not immediately flip a stronger recent buy trend into a short.
-- It uses a take-profit target (`TAKE_PROFIT_PERCENT`, default `10`).
-- It does not use a stop loss.
-- It does not score insider quality, company quality, liquidity, or risk.
-- It avoids duplicate orders by recording processed insider-trade IDs.
+To enable paper orders after reviewing the dashboard:
 
-This means it is closer to an automation prototype than a production trading system.
+```env
+DRY_RUN=false
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+```
 
-## Runtime Files
+Live trading requires a second, separate opt-in. Do not point this project at the live endpoint casually.
 
-By default, the bot writes state into the repository directory. In the container setup, it writes to `/data`.
+## Dashboard
 
-- `insider_trading.sqlite3`: primary application database.
-- `trade_history.csv`: exported trade history snapshot.
-- `seen_insider_trades.log`: exported seen-signal snapshot.
-- `pending_orders.json`: exported queue snapshot, now including `entries` and `exits`.
-- `heartbeat.txt`: loop and stage heartbeat log.
-- `app.log`: rotating application log file.
+The monitoring server listens on port `8080` by default.
 
-## Monitoring
+- `/`: responsive control-room dashboard
+- `/status`: complete JSON snapshot
+- `/metrics`: Prometheus text metrics
+- `/healthz`: process liveness
+- `/readyz`: storage and broker-clock readiness
 
-The bot now exposes a lightweight monitoring server. By default it listens on port `8080`.
+The dashboard includes:
 
-- `/`: small HTML status page.
-- `/healthz`: liveness endpoint for Docker health checks.
-- `/readyz`: same heartbeat-based readiness signal.
-- `/status`: JSON snapshot of the bot state.
-- `/metrics`: Prometheus-style text metrics.
+- Alpaca account equity return versus buy-and-hold `SPY` over the same dates
+- relative performance (account return minus benchmark return)
+- equity, buying power, gross exposure, positions, and entry limits
+- same-day round trips and closed/open swing-trade counts
+- bounded pending-order queue and retry details
+- insider outcome leaderboard based on closed trades
+- per-stage operational health
 
-The status page now also shows queued orders and a simple insider-performance leaderboard based on recorded trade outcomes.
+The benchmark is intentionally an account-level comparison. If the Alpaca account contains manual or unrelated
+trades, those affect the account line. Bot-only realized P/L is also retained in the SQLite performance summary.
+
+Set `MONITORING_TOKEN` to protect the detailed dashboard, JSON, and metrics endpoints. Health endpoints remain
+unauthenticated for container probes. With a token, open `http://host:8080/?token=...` or send an
+`Authorization: Bearer ...` header.
+
+## Day and swing activity
+
+The service records whether a closed trade was opened and closed on the same New York market date or held
+overnight. `DAY_TRADE_WARNING_LIMIT` is an informational threshold displayed in the dashboard; broker controls
+remain authoritative and safety exits are never intentionally trapped merely to conserve a counter.
+
+Alpaca removed its old PDT/day-trading fields on July 6, 2026 after the move to FINRA's intraday-margin standards.
+Do not treat the historical three-in-five heuristic as a universal current broker rule. See
+[Alpaca's migration notice](https://docs.alpaca.markets/us/changelog/2026-07-06-pdt-db49dba) and confirm the rules
+that apply to the account and broker.
 
 ## Configuration
 
-The bot now reads credentials and runtime settings from environment variables.
+Copy `.env.example` to `.env` and set fresh paper credentials. Important settings:
 
-Required:
+| Setting | Default | Meaning |
+|---|---:|---|
+| `DRY_RUN` | `true` | Evaluate without submitting orders |
+| `ALLOW_SHORTING` | `false` | Permit eligible insider-sale signals to open shorts |
+| `ALLOW_LIVE_TRADING` | `false` | Permit a non-paper Alpaca endpoint |
+| `TRADE_CAPITAL_CZK` | `250` | Target notional per entry |
+| `TAKE_PROFIT_PERCENT` | `10` | Fill-based take-profit distance |
+| `STOP_LOSS_PERCENT` | `7` | Fill-based stop-loss distance |
+| `MAX_HOLD_DAYS` | `30` | Maximum position age |
+| `SIGNAL_MAX_AGE_HOURS` | `36` | Oldest accepted Finviz signal |
+| `FINVIZ_MAX_PAGES` | `3` | Maximum pages per scrape |
+| `MAX_OPEN_POSITIONS` | `10` | Account position cap |
+| `MAX_NEW_ENTRIES_PER_DAY` | `10` | New-entry cap per New York market date |
+| `MAX_GROSS_EXPOSURE_USD` | `2500` | Maximum absolute account market value plus reserved entries |
+| `MAX_QUEUE_ATTEMPTS` | `5` | Terminal retry threshold |
+| `QUEUE_EXPIRY_HOURS` | `24` | Maximum queued-signal age |
+| `BENCHMARK_SYMBOL` | `SPY` | Buy-and-hold comparison symbol |
+| `MONITORING_TOKEN` | empty | Optional dashboard/API bearer token |
 
-- `ALPACA_API_KEY`
-- `ALPACA_SECRET_KEY`
+All numeric settings are validated at startup. See `.env.example` for the full list.
 
-Common optional settings:
+## Local run
 
-- `ALPACA_BASE_URL` default: `https://paper-api.alpaca.markets`
-- `TRADE_CAPITAL_CZK` default: `250`
-- `TAKE_PROFIT_PERCENT` default: `10`
-- `INSIDER_SCAN_INTERVAL_MINUTES` default: `5`
-- `POSITION_CHECK_INTERVAL_MINUTES` default: `2`
-- `MARKET_OPEN_POLL_SECONDS` default: `30`
-- `MARKET_CLOSED_POLL_SECONDS` default: `300`
-- `STATE_DIR` default: repository directory
-- `LOG_DIR` default: repository directory
-- `SQLITE_DB_PATH` default: `insider_trading.sqlite3` inside the state directory
-- `MONITORING_ENABLED` default: `true`
-- `MONITORING_PORT` default: `8080`
-
-See [.env.example](.env.example) for a working container example.
-
-Important: older revisions of this repository contained hard-coded Alpaca paper keys. If those keys were ever valid, revoke them.
-
-## Local Python Run
-
-Install dependencies:
+Python 3.11 is the supported runtime.
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+export ALPACA_API_KEY="..."
+export ALPACA_SECRET_KEY="..."
+export DRY_RUN="true"
+python main.py
 ```
 
-Run the bot:
+On PowerShell, activate with `.venv\Scripts\Activate.ps1` and set variables with `$env:NAME="value"`.
+
+`python alpaca.py` is a read-only connectivity check. It no longer submits a test order.
+
+## Docker
 
 ```bash
-ALPACA_API_KEY=... ALPACA_SECRET_KEY=... python main.py
-```
-
-## Docker Run
-
-Build and start:
-
-```bash
+mkdir -p data
+sudo chown -R 10001:10001 data
 docker compose up -d --build
 ```
 
-The included `docker-compose.yml`:
+The image runs as UID/GID `10001`, uses a read-only root filesystem, and writes state only under `/data`. Ensure the
+host `./data` directory is writable by that identity before starting the container. The local `.env` and generated
+TrueNAS YAML are excluded from the Docker build context.
 
-- builds the image from the local `Dockerfile`
-- loads variables from `.env`
-- persists runtime state in `./data`
-- exposes the monitoring UI on port `8080`
+## Persistent state
 
-## TrueNAS Deployment
+SQLite is the source of truth:
 
-This repository now includes two paths that fit a TrueNAS-style deployment:
+- `insider_trading.sqlite3`: signals, bounded queue, order/fill lifecycle, exits, metadata
+- `trade_history.csv`: compatibility export
+- `seen_insider_trades.log`: compatibility export
+- `pending_orders.json`: compatibility queue view
+- `heartbeat.txt`: latest liveness record only
+- `logs/app.log`: rotating detailed logs
 
-### Option 1: Publish an image and deploy it as a custom app
+Existing databases are migrated in place. Keep backups of `/data` before deploying a new image.
 
-Use the included GitHub Actions workflow at [.github/workflows/publish-image.yml](.github/workflows/publish-image.yml) to publish the image to GHCR on pushes to `main`.
+## Tests and CI
 
-Then use [truenas-compose.yaml](truenas-compose.yaml) as the template for your TrueNAS custom app:
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
 
-- the default image is already set to `ghcr.io/natex-corporation/insider-trading:latest`
-- replace `/mnt/POOLNAME/apps/insider-trading:/data` with a real dataset path on your NAS
-- set your Alpaca credentials in the environment section
+Container publishing now depends on lint and tests passing. Runtime dependencies are pinned for reproducible builds.
 
-This is the cleanest approach for TrueNAS because the server pulls a ready-made image and keeps bot state in a mounted dataset.
+## TrueNAS
 
-If you want the YAML generated for you, use [scripts/render_truenas_compose.py](scripts/render_truenas_compose.py) and see [TRUENAS_DEPLOY.md](TRUENAS_DEPLOY.md).
-
-### Option 2: Run it on a normal Docker host first
-
-If you want to validate behavior before moving it to TrueNAS, use the local `docker-compose.yml`, then deploy the same image to TrueNAS later.
-
-## Legacy LXC Deployment
-
-The old LXC/systemd helper is still present in [scripts/setup_lxc.sh](scripts/setup_lxc.sh), but it now requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` to be set before running the installer.
-
-## Files Added For Container Migration
-
-- [Dockerfile](Dockerfile): container image definition
-- [docker-compose.yml](docker-compose.yml): local Docker deployment
-- [truenas-compose.yaml](truenas-compose.yaml): TrueNAS custom-app template
-- [scripts/healthcheck.py](scripts/healthcheck.py): health probe used by Docker
-- [scripts/render_truenas_compose.py](scripts/render_truenas_compose.py): generates a TrueNAS-ready custom-app YAML
-- [config.py](config.py): environment-driven config loader
-- [monitoring.py](monitoring.py): health, status, and metrics server
-- [storage.py](storage.py): SQLite-backed state, queue, and insider analytics
+See [TRUENAS_DEPLOY.md](TRUENAS_DEPLOY.md). Generated compose files contain credentials, are written with restrictive
+permissions where supported, are Git/Docker ignored, and should be deleted after use when practical.
 
 ## Disclaimer
 
-This repository is for educational use. It submits automated paper trades and depends on third-party websites and APIs that can change without notice. Use it only after reviewing the code and understanding the risks.
+This project is for educational paper trading. Insider transactions are not inherently predictive, third-party HTML
+and APIs can change, and automated trading can lose money. Broker restrictions and applicable law take precedence
+over local counters or settings.

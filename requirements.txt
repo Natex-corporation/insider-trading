@@ -1,4 +1,4 @@
-alpaca-trade-api
-beautifulsoup4
-pandas
-requests
+alpaca-trade-api==3.2.0
+beautifulsoup4==4.15.0
+pandas==3.0.3
+requests==2.34.2

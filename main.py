@@ -1,18 +1,22 @@
-import datetime
+from __future__ import annotations
+
+import datetime as dt
 import functools
 import hashlib
-import json
 import logging
+import math
 import os
 import re
 import sys
 import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import requests
-from alpaca_trade_api.rest import REST, APIError
+from alpaca_trade_api.rest import APIError, REST
 from bs4 import BeautifulSoup
-from logging.handlers import RotatingFileHandler
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -26,24 +30,19 @@ try:
 except ValueError as exc:
     raise SystemExit(str(exc)) from exc
 
-# --- Basic Setup ---
 REQUEST_TIMEOUT = CONFIG.request_timeout
 HEARTBEAT_FILE = CONFIG.heartbeat_file
 APP_LOG_FILE = CONFIG.app_log_file
-SQLITE_DB_PATH = CONFIG.sqlite_db_path
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-# Console handler
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
-logger.addHandler(console_handler)
-
-# Rotating file handler (~5 MB total across 5 files)
-file_handler = RotatingFileHandler(APP_LOG_FILE, maxBytes=1_000_000, backupCount=5)
-file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
-logger.addHandler(file_handler)
+if not logger.handlers:
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(console_handler)
+    file_handler = RotatingFileHandler(APP_LOG_FILE, maxBytes=2_000_000, backupCount=5)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(file_handler)
 
 log = logging.getLogger(__name__)
 RUNTIME_STATE = RuntimeState(CONFIG.health_max_age_seconds)
@@ -62,132 +61,127 @@ def make_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; InsiderEdge/2.0)"})
     return session
 
 
 SESSION = make_session()
-
-
-def heartbeat(stage: str, ok: bool = True, note: str = ""):
-    try:
-        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
-        status = "OK" if ok else "ERR"
-        line = f"{timestamp}\t{stage}\t{status}\t{note}\n"
-        with open(HEARTBEAT_FILE, "a", encoding="utf-8") as hb:
-            hb.write(line)
-            hb.flush()
-            os.fsync(hb.fileno())
-    except Exception as exc:
-        log.error(f"Failed to write heartbeat: {exc}")
-    finally:
-        RUNTIME_STATE.record_heartbeat(stage, ok=ok, note=note)
-
-# --- ALPACA API CONFIGURATION ---
-API_KEY = CONFIG.api_key
-SECRET_KEY = CONFIG.secret_key
-BASE_URL = CONFIG.base_url
-
-# --- State Management & Parameters ---
-TRADE_HISTORY_CSV = CONFIG.trade_history_csv
-SEEN_TRADES_LOG = CONFIG.seen_trades_log
-PENDING_ORDERS_JSON = CONFIG.pending_orders_json
-STATE_DB_PATH = CONFIG.sqlite_db_path
-
-TRADE_CAPITAL_CZK = CONFIG.trade_capital_czk
-TAKE_PROFIT_PERCENT = CONFIG.take_profit_percent
-INSIDER_SCAN_INTERVAL_MINUTES = CONFIG.insider_scan_interval_minutes
-POSITION_CHECK_INTERVAL_MINUTES = CONFIG.position_check_interval_minutes
-MARKET_OPEN_POLL_SECONDS = CONFIG.market_open_poll_seconds
-MARKET_CLOSED_POLL_SECONDS = CONFIG.market_closed_poll_seconds
-
-OPTIONS_NOISE_PATTERN = re.compile(
-    r"(option|exercise|derivative|convert|conversion|grant|award)",
-    re.IGNORECASE,
+STORAGE = Storage(
+    db_path=CONFIG.sqlite_db_path,
+    trade_history_csv=CONFIG.trade_history_csv,
+    seen_trades_log=CONFIG.seen_trades_log,
+    pending_orders_json=CONFIG.pending_orders_json,
+    log=log,
 )
+
+OPTIONS_NOISE_PATTERN = re.compile(r"(option|exercise|derivative|convert|conversion|grant|award)", re.IGNORECASE)
 PROPOSED_TRANSACTION_PATTERN = re.compile(r"proposed", re.IGNORECASE)
 COMPANY_HISTORY_ROW_LIMIT = 12
 COMPANY_TREND_DOMINANCE_RATIO = 1.5
 PROPOSED_TRANSACTION_WEIGHT = 0.25
-STORAGE = Storage(
-    db_path=STATE_DB_PATH,
-    trade_history_csv=TRADE_HISTORY_CSV,
-    seen_trades_log=SEEN_TRADES_LOG,
-    pending_orders_json=PENDING_ORDERS_JSON,
-    log=log,
-)
+ORDER_TERMINAL_STATUSES = {"filled", "canceled", "expired", "rejected", "replaced", "done_for_day"}
 
 
-def refresh_runtime_views() -> None:
+def heartbeat(stage: str, ok: bool = True, note: str = "") -> None:
+    """Persist only the latest heartbeat; detailed history belongs in the rotating app log."""
+    try:
+        timestamp = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        line = f"{timestamp}\t{stage}\t{'OK' if ok else 'ERR'}\t{note}\n"
+        temporary = Path(f"{HEARTBEAT_FILE}.tmp")
+        temporary.write_text(line, encoding="utf-8")
+        os.replace(temporary, HEARTBEAT_FILE)
+    except Exception as exc:
+        log.error("Failed to write heartbeat: %s", exc)
+    finally:
+        RUNTIME_STATE.record_heartbeat(stage, ok=ok, note=note)
+
+
+def safe_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def object_value(obj: Any, name: str, default: Any = None) -> Any:
+    return obj.get(name, default) if isinstance(obj, dict) else getattr(obj, name, default)
+
+
+def refresh_runtime_views(context: dict[str, Any] | None = None) -> None:
     RUNTIME_STATE.update_pending_orders(STORAGE.get_pending_summary())
     RUNTIME_STATE.set_trade_history_rows(STORAGE.count_trade_history())
     RUNTIME_STATE.set_queue_preview(STORAGE.get_queue_preview())
     RUNTIME_STATE.set_insider_leaderboard(STORAGE.get_insider_leaderboard())
+    RUNTIME_STATE.set_activity(
+        STORAGE.get_trading_activity(
+            business_days=CONFIG.day_trade_window_business_days,
+            warning_limit=CONFIG.day_trade_warning_limit,
+        )
+    )
+    if context is not None:
+        RUNTIME_STATE.set_account(context["account_snapshot"])
+        RUNTIME_STATE.set_risk(risk_snapshot(context))
 
 
 def get_usd_per_czk() -> float | None:
     try:
-        url = "https://api.exchangerate-api.com/v4/latest/CZK"
-        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        response = SESSION.get("https://api.exchangerate-api.com/v4/latest/CZK", timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        data = response.json()
-        rate = data['rates']['USD']
-        log.info(f"Fetched CZK to USD exchange rate: {rate}")
-        return float(rate)
-    except Exception as e:
-        log.error(f"Could not fetch CZK to USD exchange rate: {e}")
+        rate = safe_float(response.json().get("rates", {}).get("USD"))
+        if rate is None or rate <= 0:
+            raise ValueError("response did not contain a positive USD rate")
+        return rate
+    except Exception as exc:
+        log.error("Could not fetch CZK to USD exchange rate: %s", exc)
         return None
 
 
-def effective_insider_scan_interval_minutes(is_market_open: bool) -> int:
-    target = 2 if is_market_open else 5
-    return max(1, min(INSIDER_SCAN_INTERVAL_MINUTES, target))
-
-
-def effective_position_check_interval_minutes() -> int:
-    return max(1, min(POSITION_CHECK_INTERVAL_MINUTES, 2))
-
-
-def normalize_utc_datetime(value: datetime.datetime | None) -> datetime.datetime | None:
+def normalize_utc_datetime(value: dt.datetime | None) -> dt.datetime | None:
     if value is None:
         return None
-    if value.tzinfo is not None:
-        return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-    return value
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
 
 
 def compute_sleep_seconds(
-    *,
-    is_market_open: bool,
-    pending_orders: dict,
-    next_open_at: datetime.datetime | None,
+    *, is_market_open: bool, pending_orders: dict[str, Any], next_open_at: dt.datetime | None
 ) -> int:
     if is_market_open:
-        return max(15, min(MARKET_OPEN_POLL_SECONDS, 30))
+        return max(5, CONFIG.market_open_poll_seconds)
+    configured = max(15, CONFIG.market_closed_poll_seconds)
+    has_pending = bool(pending_orders.get("buy") or pending_orders.get("sell"))
+    normalized = normalize_utc_datetime(next_open_at)
+    if has_pending and normalized is not None:
+        until_open = max(15, int((normalized - dt.datetime.now(dt.timezone.utc)).total_seconds()))
+        return min(configured, until_open)
+    return configured
 
-    has_pending = bool((pending_orders.get("buy") or []) or (pending_orders.get("sell") or []))
-    if has_pending:
-        normalized_next_open = normalize_utc_datetime(next_open_at)
-        if normalized_next_open is not None:
-            seconds_until_open = max(15, int((normalized_next_open - datetime.datetime.utcnow()).total_seconds()))
-            return min(seconds_until_open, 60)
-        return max(15, min(MARKET_CLOSED_POLL_SECONDS, 60))
 
-    return max(60, min(MARKET_CLOSED_POLL_SECONDS, 300))
-
-def parse_finviz_date(raw: str) -> datetime.date | None:
-    # This function is from your script and remains unchanged.
-    try: return datetime.datetime.strptime(raw.strip(), "%b %d '%y").date()
+def parse_finviz_date(raw: str) -> dt.date | None:
+    text = raw.strip()
+    try:
+        return dt.datetime.strptime(text, "%b %d '%y").date()
     except ValueError:
-        try:
-            dt = datetime.datetime.strptime(raw.strip(), "%b %d").date()
-            return dt.replace(year=datetime.date.today().year)
-        except Exception: return None
+        pass
+    try:
+        partial = dt.datetime.strptime(f"{text} 2000", "%b %d %Y").date()
+    except ValueError:
+        return None
+    today = dt.date.today()
+    candidate = partial.replace(year=today.year)
+    if candidate > today + dt.timedelta(days=7):
+        candidate = candidate.replace(year=today.year - 1)
+    return candidate
 
-def infer_direction(txn: str) -> str | None:
-    lower = txn.lower()
-    if 'buy' in lower: return 'buy'
-    if 'sell' in lower or 'sale' in lower: return 'sell'
+
+def infer_direction(transaction: str) -> str | None:
+    lowered = transaction.lower()
+    if "buy" in lowered or "purchase" in lowered:
+        return "buy"
+    if "sell" in lowered or "sale" in lowered:
+        return "sell"
     return None
 
 
@@ -197,63 +191,50 @@ def parse_numeric_text(raw: str | None) -> float | None:
     cleaned = str(raw).replace(",", "").replace("$", "").strip()
     if cleaned in {"", "-", "None", "nan"}:
         return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
+    return safe_float(cleaned)
 
 
 def signal_weight_for_transaction(transaction: str) -> float:
     return PROPOSED_TRANSACTION_WEIGHT if PROPOSED_TRANSACTION_PATTERN.search(transaction) else 1.0
 
 
-def fetch_company_insider_activity(ticker: str) -> list[dict]:
-    company_url = f"https://finviz.com/quote.ashx?t={ticker}"
+def make_trade_id(parts: list[str]) -> str:
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:20]
+    return f"{parts[0]}-{parts[1]}-{digest}"
+
+
+def fetch_company_insider_activity(ticker: str) -> list[dict[str, Any]]:
+    url = f"https://finviz.com/quote.ashx?t={ticker}"
     try:
-        resp = SESSION.get(company_url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+        response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
     except requests.RequestException as exc:
-        log.warning(f"Could not fetch company insider activity for {ticker}: {exc}")
+        log.warning("Could not fetch company insider activity for %s: %s", ticker, exc)
         return []
-
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    rows = []
-    for tr in soup.select("tr.fv-insider-row"):
-        tds = tr.find_all("td")
-        if len(tds) < 7:
+    soup = BeautifulSoup(response.text, "html.parser")
+    records: list[dict[str, Any]] = []
+    for row in soup.select("tr.fv-insider-row"):
+        cells = row.find_all("td")
+        if len(cells) < 7:
             continue
-
-        owner = tds[0].get_text(" ", strip=True)
-        relationship = tds[1].get_text(" ", strip=True) or None
-        date_raw = tds[2].get_text(" ", strip=True)
-        transaction = tds[3].get_text(" ", strip=True)
-        cost = parse_numeric_text(tds[4].get_text(" ", strip=True))
-        shares_value = parse_numeric_text(tds[5].get_text(" ", strip=True))
-        value_usd = parse_numeric_text(tds[6].get_text(" ", strip=True))
-        date = parse_finviz_date(date_raw)
+        owner = cells[0].get_text(" ", strip=True)
+        relationship = cells[1].get_text(" ", strip=True) or None
+        date = parse_finviz_date(cells[2].get_text(" ", strip=True))
+        transaction = cells[3].get_text(" ", strip=True)
+        cost = parse_numeric_text(cells[4].get_text(" ", strip=True))
+        shares_value = parse_numeric_text(cells[5].get_text(" ", strip=True))
+        value_usd = parse_numeric_text(cells[6].get_text(" ", strip=True))
         direction = infer_direction(transaction)
-
         if date is None or direction is None or OPTIONS_NOISE_PATTERN.search(transaction):
             continue
-
-        shares = int(shares_value) if shares_value is not None else 0
-        if value_usd is None and cost is not None and shares > 0:
-            value_usd = cost * shares
-        if value_usd is None or value_usd <= 0:
+        shares = int(shares_value or 0)
+        value_usd = value_usd or ((cost or 0) * shares)
+        if value_usd <= 0:
             continue
-
-        rows.append(
+        records.append(
             {
                 "trade_id": make_trade_id(
-                    [
-                        date.isoformat(),
-                        ticker,
-                        owner,
-                        relationship or "",
-                        transaction,
-                        str(cost),
-                        str(shares),
-                    ]
+                    [date.isoformat(), ticker, owner, relationship or "", transaction, str(cost), str(shares)]
                 ),
                 "direction": direction,
                 "transaction_type": transaction,
@@ -261,796 +242,838 @@ def fetch_company_insider_activity(ticker: str) -> list[dict]:
                 "weighted_value_usd": value_usd * signal_weight_for_transaction(transaction),
             }
         )
-    return rows
+    return records
 
 
 def resolve_direction_with_company_history(
-    trade_details,
-    company_history_cache: dict[str, list[dict]],
-):
-    trade_info = trade_details.to_dict() if isinstance(trade_details, pd.Series) else dict(trade_details)
-    ticker = trade_info.get("ticker")
-    direction = trade_info.get("direction")
-    if not ticker or direction != "sell":
-        return trade_info
-
-    company_history = company_history_cache.get(ticker)
-    if company_history is None:
-        company_history = fetch_company_insider_activity(ticker)
-        company_history_cache[ticker] = company_history
-    if not company_history:
-        return trade_info
-
-    history_rows = [row for row in company_history if row.get("trade_id") != trade_info.get("trade_id")]
-    if not history_rows:
-        return trade_info
-
-    recent_rows = history_rows[:COMPANY_HISTORY_ROW_LIMIT]
-    buy_strength = sum(row["weighted_value_usd"] for row in recent_rows if row["direction"] == "buy")
-    sell_strength = sum(row["weighted_value_usd"] for row in recent_rows if row["direction"] == "sell")
-    if buy_strength <= 0 and sell_strength <= 0:
-        return trade_info
-
-    if buy_strength <= sell_strength:
-        return trade_info
-
-    if sell_strength > 0 and (buy_strength / sell_strength) < COMPANY_TREND_DOMINANCE_RATIO:
-        return trade_info
-
-    current_value = parse_numeric_text(str(trade_info.get("value_usd") or ""))
-    current_strength = (current_value or 0.0) * signal_weight_for_transaction(
-        str(trade_info.get("transaction_type") or "")
+    trade_details: dict[str, Any] | pd.Series,
+    cache: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    trade = trade_details.to_dict() if isinstance(trade_details, pd.Series) else dict(trade_details)
+    ticker = trade.get("ticker")
+    if not ticker or trade.get("direction") != "sell":
+        return trade
+    history = cache.get(ticker)
+    if history is None:
+        history = fetch_company_insider_activity(ticker)
+        cache[ticker] = history
+    rows = [item for item in history if item.get("trade_id") != trade.get("trade_id")][:COMPANY_HISTORY_ROW_LIMIT]
+    buy_strength = sum(item["weighted_value_usd"] for item in rows if item["direction"] == "buy")
+    sell_strength = sum(item["weighted_value_usd"] for item in rows if item["direction"] == "sell")
+    current_strength = (safe_float(trade.get("value_usd"), 0.0) or 0.0) * signal_weight_for_transaction(
+        str(trade.get("transaction_type") or "")
     )
-    current_side_history = sell_strength
-    opposing_history = buy_strength
-    projected_current_strength = current_side_history + current_strength
-    if projected_current_strength >= opposing_history:
-        return trade_info
-
-    trade_info["direction"] = "buy"
-    log.info(
-        "Adjusted %s signal for %s from %s to %s using company insider history "
-        "(buy_strength=$%.0f, sell_strength=$%.0f, current_strength=$%.0f).",
-        trade_info.get("trade_id"),
-        ticker,
-        direction,
-        "buy",
-        buy_strength,
-        sell_strength,
-        current_strength,
-    )
-    return trade_info
+    if (
+        buy_strength > sell_strength
+        and (sell_strength <= 0 or buy_strength / sell_strength >= COMPANY_TREND_DOMINANCE_RATIO)
+        and sell_strength + current_strength < buy_strength
+    ):
+        trade["direction"] = "buy"
+        log.info(
+            "Adjusted %s for %s from sell to buy (buy strength %.0f, sell strength %.0f).",
+            trade.get("trade_id"),
+            ticker,
+            buy_strength,
+            sell_strength,
+        )
+    return trade
 
 
-def classify_options_noise(records: list[dict]) -> list[dict]:
-    option_groups: set[tuple[str, str, str, int]] = set()
-    for record in records:
-        transaction_type = str(record.get("transaction_type") or "")
-        if OPTIONS_NOISE_PATTERN.search(transaction_type):
-            option_groups.add(
-                (
-                    str(record.get("ticker") or ""),
-                    str(record.get("insider") or ""),
-                    str(record.get("insider_date") or ""),
-                    int(record.get("shares") or 0),
-                )
-            )
-
-    for record in records:
-        filter_reason = record.get("filter_reason")
-        transaction_type = str(record.get("transaction_type") or "")
-        group_key = (
+def classify_options_noise(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    option_groups = {
+        (
             str(record.get("ticker") or ""),
             str(record.get("insider") or ""),
             str(record.get("insider_date") or ""),
             int(record.get("shares") or 0),
         )
-        if OPTIONS_NOISE_PATTERN.search(transaction_type):
+        for record in records
+        if OPTIONS_NOISE_PATTERN.search(str(record.get("transaction_type") or ""))
+    }
+    for record in records:
+        group = (
+            str(record.get("ticker") or ""),
+            str(record.get("insider") or ""),
+            str(record.get("insider_date") or ""),
+            int(record.get("shares") or 0),
+        )
+        transaction = str(record.get("transaction_type") or "")
+        if OPTIONS_NOISE_PATTERN.search(transaction):
             record["filter_reason"] = "options_noise"
-        elif (
-            group_key in option_groups
-            and str(record.get("direction")) == "sell"
-        ):
+        elif group in option_groups and record.get("direction") == "sell":
             record["filter_reason"] = "paired_with_option_activity"
-        else:
-            record["filter_reason"] = filter_reason
     return records
 
 
-def make_trade_id(parts: list[str]) -> str:
-    raw = "|".join(parts)
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
-    return f"{parts[0]}-{parts[1]}-{digest}"
-
-# --------------------------------------------------
-# 1. Scrape insider transactions from Finviz
-# --------------------------------------------------
 def fetch_insider_trades() -> pd.DataFrame:
-    base_url = 'https://finviz.com/insidertrading.ashx'
-    all_records = []
-    current_page = 1
+    base_url = "https://finviz.com/insidertrading.ashx"
     current_url = base_url
-    while True:
-        log.info(f"Fetching insider trades from: {current_url}")
+    records: list[dict[str, Any]] = []
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=CONFIG.signal_max_age_hours)).date()
+    for page_number in range(1, CONFIG.finviz_max_pages + 1):
+        log.info("Fetching recent insider trades from %s", current_url)
         try:
-            resp = SESSION.get(current_url, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            log.error(f"Failed to fetch Finviz page: {e}")
+            response = SESSION.get(current_url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            log.error("Failed to fetch Finviz page: %s", exc)
             break
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        target_table = None
-        header_map = {}
-        for table in soup.find_all('table'):
-            first_row = table.find('tr')
+        soup = BeautifulSoup(response.text, "html.parser")
+        table = None
+        header_map: dict[str, int] = {}
+        for candidate in soup.find_all("table"):
+            first_row = candidate.find("tr")
             if not first_row:
                 continue
-            header_cells = [cell.get_text(strip=True) for cell in first_row.find_all(['td', 'th'])]
-            normalized_headers = [re.sub(r'[^a-zA-Z0-9]', '', h).lower() for h in header_cells]
-            if 'ticker' in normalized_headers and 'transaction' in normalized_headers and 'shares' in normalized_headers:
-                header_map = {name: i for i, name in enumerate(normalized_headers)}
-                target_table = table
+            headers = [
+                re.sub(r"[^a-zA-Z0-9]", "", cell.get_text(strip=True)).lower()
+                for cell in first_row.find_all(["td", "th"])
+            ]
+            if {"ticker", "transaction", "shares", "date", "cost"}.issubset(headers):
+                table = candidate
+                header_map = {name: index for index, name in enumerate(headers)}
                 break
-
-        if not target_table:
-            log.error("Could not find a valid insider trading table on the page.")
+        if table is None:
+            log.error("Finviz insider table was not found; the page layout may have changed.")
             break
-
-        rows = target_table.find_all('tr')[1:]
-        if not rows:
-            log.info("No more trade rows found on this page. Ending scrape.")
-            break
-
-        for tr in rows:
-            tds = tr.find_all('td')
-            if len(tds) < len(header_map):
+        page_dates: list[dt.date] = []
+        for row in table.find_all("tr")[1:]:
+            cells = row.find_all("td")
+            if len(cells) <= max(header_map.values()):
                 continue
             try:
-                ticker = tds[header_map['ticker']].text.strip()
-                transaction = tds[header_map['transaction']].text.strip()
-                date_raw = tds[header_map['date']].text.strip()
-                cost_raw = tds[header_map['cost']].text.strip()
-                shares_raw = tds[header_map['shares']].text.strip()
-                owner = tds[header_map.get('owner', header_map.get('insidername', -1))].text.strip()
-                relationship_idx = header_map.get('relationship', -1)
-                relationship = tds[relationship_idx].text.strip() if relationship_idx >= 0 else None
-                value_idx = header_map.get('value', header_map.get('valueusd', -1))
-                value_raw = tds[value_idx].text.strip() if value_idx >= 0 else None
-                direction = infer_direction(transaction)
-                cost = parse_numeric_text(cost_raw)
-                shares_value = parse_numeric_text(shares_raw)
-                date = parse_finviz_date(date_raw)
-                if cost in (None, 0) or not date or shares_value is None:
+                ticker = cells[header_map["ticker"]].get_text(strip=True).upper()
+                transaction = cells[header_map["transaction"]].get_text(strip=True)
+                date = parse_finviz_date(cells[header_map["date"]].get_text(strip=True))
+                if date is None:
                     continue
-                shares = int(shares_value)
-                value_usd = None
-                if value_raw:
-                    value_usd = parse_numeric_text(value_raw)
-                if value_usd is None:
-                    value_usd = float(cost * shares)
-                trade_id = make_trade_id(
-                    [
-                        date.isoformat(),
-                        ticker,
-                        owner,
-                        relationship or "",
-                        transaction,
-                        str(cost),
-                        str(shares),
-                    ]
+                page_dates.append(date)
+                if date < cutoff:
+                    continue
+                cost = parse_numeric_text(cells[header_map["cost"]].get_text(strip=True))
+                shares_value = parse_numeric_text(cells[header_map["shares"]].get_text(strip=True))
+                if cost in (None, 0) or shares_value is None:
+                    continue
+                owner_index = header_map.get("owner", header_map.get("insidername"))
+                owner = cells[owner_index].get_text(strip=True) if owner_index is not None else "Unknown"
+                relationship_index = header_map.get("relationship")
+                relationship = (
+                    cells[relationship_index].get_text(strip=True) if relationship_index is not None else None
                 )
-                all_records.append(
+                value_index = header_map.get("value", header_map.get("valueusd"))
+                shares = int(shares_value)
+                value = parse_numeric_text(cells[value_index].get_text(strip=True)) if value_index is not None else None
+                value = value if value is not None else cost * shares
+                direction = infer_direction(transaction)
+                trade_id = make_trade_id(
+                    [date.isoformat(), ticker, owner, relationship or "", transaction, str(cost), str(shares)]
+                )
+                records.append(
                     {
-                        'trade_id': trade_id,
-                        'ticker': ticker,
-                        'direction': direction,
-                        'transaction_type': transaction,
-                        'cost': cost,
-                        'shares': shares,
-                        'value_usd': value_usd,
-                        'insider_date': date,
-                        'insider': owner,
-                        'relationship': relationship,
-                        'source_url': current_url,
-                        'source_page': current_page,
-                        'filter_reason': None,
+                        "trade_id": trade_id,
+                        "ticker": ticker,
+                        "direction": direction,
+                        "transaction_type": transaction,
+                        "cost": cost,
+                        "shares": shares,
+                        "value_usd": value,
+                        "insider_date": date,
+                        "insider": owner,
+                        "relationship": relationship,
+                        "source_url": current_url,
+                        "source_page": page_number,
+                        "filter_reason": None,
                     }
                 )
-            except (ValueError, KeyError, IndexError) as e:
-                log.warning(f"Skipping a row due to parsing error: {e}")
-                continue
-
-        next_link = soup.find('a', string='next')
-        if next_link and next_link.get('href'):
-            current_url = 'https://finviz.com/' + next_link.get('href')
-            current_page += 1
-            time.sleep(1)
-        else:
-            log.info("No 'next' page link found. Scrape complete.")
+            except (ValueError, KeyError, IndexError) as exc:
+                log.warning("Skipping malformed Finviz row: %s", exc)
+        if page_dates and max(page_dates) < cutoff:
             break
-
-    all_records = classify_options_noise(all_records)
-    return pd.DataFrame(all_records)
-
-# --------------------------------------------------
-# 2. Live Trading Logic and Persistent Memory
-# --------------------------------------------------
-
-
-def refresh_trade_history_metrics() -> None:
-    try:
-        STORAGE.export_legacy_files()
-        refresh_runtime_views()
-    except Exception as exc:
-        log.warning(f"Could not refresh storage-backed metrics: {exc}")
+        next_link = soup.find("a", string=lambda text: bool(text and text.strip().lower() == "next"))
+        if not next_link or not next_link.get("href"):
+            break
+        current_url = requests.compat.urljoin(base_url, next_link.get("href"))
+        time.sleep(0.5)
+    return pd.DataFrame(classify_options_noise(records))
 
 
-def load_seen_trade_ids() -> set:
-    return STORAGE.load_seen_trade_ids()
+def make_client_order_id(trade_id: str, prefix: str = "insider") -> str:
+    digest = hashlib.sha256(trade_id.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}-{digest}"
 
-def log_trades_as_seen(new_trade_ids: list):
-    for trade_id in new_trade_ids:
-        STORAGE.mark_trade_seen(trade_id)
-    log.info(f"Logged {len(new_trade_ids)} new trades to SQLite seen state.")
 
-def load_trade_history() -> pd.DataFrame:
-    df = STORAGE.get_trade_history_df()
-    RUNTIME_STATE.set_trade_history_rows(len(df.index))
-    return df
-
-def log_trade_to_history(
-    trade_details,
-    order_obj,
-    entry_price: float,
-    tp_price: float,
-    sl_price: float | None = None,
-):
-    if isinstance(trade_details, pd.Series):
-        trade_info = trade_details.to_dict()
-    else:
-        trade_info = dict(trade_details)
-
-    insider_date = trade_info.get('insider_date')
-    if isinstance(insider_date, (datetime.date, datetime.datetime)):
-        insider_date_str = insider_date.isoformat()
-    elif insider_date is not None:
-        insider_date_str = str(insider_date)
-    else:
-        insider_date_str = None
-
-    record = {
-        'trade_id': trade_info.get('trade_id'), 'timestamp_utc': datetime.datetime.utcnow().isoformat(),
-        'ticker': order_obj.symbol, 'side': order_obj.side, 'order_qty': order_obj.qty,
-        'insider_date': insider_date_str, 'insider_name': trade_info.get('insider'),
-        'estimated_entry_price': entry_price, 'take_profit_price': tp_price, 'stop_loss_price': sl_price,
-        'alpaca_order_id': order_obj.id, 'status': order_obj.status, 'exit_reason': None,
-        'exit_timestamp_utc': None
+def get_broker_context(api: REST) -> dict[str, Any]:
+    account = api.get_account()
+    positions = list(api.list_positions())
+    account_snapshot = {
+        "equity": safe_float(object_value(account, "equity")),
+        "cash": safe_float(object_value(account, "cash")),
+        "buying_power": safe_float(object_value(account, "buying_power")),
+        "portfolio_value": safe_float(object_value(account, "portfolio_value")),
+        "trading_blocked": bool(object_value(account, "trading_blocked", False)),
+        "account_blocked": bool(object_value(account, "account_blocked", False)),
+        "trade_suspended_by_user": bool(object_value(account, "trade_suspended_by_user", False)),
     }
-    STORAGE.record_trade_execution(trade_info, order_obj, entry_price, tp_price, sl_price)
-    log.info(f"Successfully logged trade execution {record['trade_id']} to SQLite trade history.")
-    refresh_runtime_views()
+    return {
+        "account": account,
+        "account_snapshot": account_snapshot,
+        "positions": positions,
+        "positions_by_symbol": {str(object_value(position, "symbol")): position for position in positions},
+        "projected_open_positions": len(positions),
+        "reserved_notional_usd": 0.0,
+    }
 
 
-def update_trade_exit_in_history(symbol: str, exit_reason: str, exit_price: float | None = None):
-    STORAGE.update_trade_exit(symbol, exit_reason, exit_price)
-    log.info(f"Updated trade history for {symbol} with exit reason '{exit_reason}'.")
-    refresh_runtime_views()
-
-
-def ensure_pending_structure(data: dict | None) -> dict:
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault('buy', [])
-    data.setdefault('sell', [])
-    return data
-
-
-def load_pending_orders() -> dict:
-    pending = ensure_pending_structure(STORAGE.load_pending_orders())
-    RUNTIME_STATE.update_pending_orders(STORAGE.get_pending_summary())
-    return pending
-
-
-def save_pending_orders(pending_orders: dict):
-    STORAGE.export_legacy_files()
-    log.info(f"Persisted pending orders queue to {STATE_DB_PATH}.")
-    refresh_runtime_views()
-
-
-def queue_pending_trade(pending_orders: dict, trade_details) -> bool:
-    trade_info = trade_details.to_dict() if isinstance(trade_details, pd.Series) else dict(trade_details)
-    trade_id = trade_info.get('trade_id')
-    ticker = trade_info.get('ticker')
-    if not trade_id or not ticker:
-        log.warning("Cannot queue trade without trade_id and ticker.")
-        return False
-
-    if not STORAGE.queue_entry(trade_info):
-        log.info(f"Trade {trade_id} for {ticker} is already queued for execution.")
-        return False
-
-    log.info(
-        "Queued %s order for %s (%s) from %s [%s | %s] until market hours.",
-        trade_info.get('direction', 'buy'),
-        ticker,
-        trade_id,
-        trade_info.get('insider') or 'unknown insider',
-        trade_info.get('relationship') or 'unknown relationship',
-        trade_info.get('transaction_type') or 'unknown transaction',
+def risk_snapshot(context: dict[str, Any]) -> dict[str, Any]:
+    gross = sum(
+        abs(safe_float(object_value(position, "market_value"), 0.0) or 0.0) for position in context["positions"]
     )
-    refresh_runtime_views()
-    return True
+    gross += safe_float(context.get("reserved_notional_usd"), 0.0) or 0.0
+    return {
+        "open_positions": int(context.get("projected_open_positions", len(context["positions"]))),
+        "max_open_positions": CONFIG.max_open_positions,
+        "entries_today": STORAGE.count_entries_on_market_date(),
+        "max_new_entries_per_day": CONFIG.max_new_entries_per_day,
+        "gross_exposure_usd": round(gross, 2),
+        "max_gross_exposure_usd": CONFIG.max_gross_exposure_usd,
+    }
 
 
-def queue_pending_sell(pending_orders: dict, symbol: str, reason: str) -> bool:
-    if not symbol:
-        log.warning("Cannot queue sell order without a symbol.")
-        return False
+def check_entry_risk(
+    api: REST,
+    trade: dict[str, Any],
+    capital_usd: float,
+    context: dict[str, Any],
+) -> tuple[bool, str, Any | None]:
+    symbol = str(trade.get("ticker") or "").upper()
+    side = trade.get("direction")
+    if not symbol or side not in {"buy", "sell"}:
+        return False, "invalid symbol or side", None
+    if not CONFIG.is_paper_account and not CONFIG.allow_live_trading:
+        return False, "live endpoint is not explicitly enabled", None
+    account = context["account_snapshot"]
+    if account["trading_blocked"] or account["account_blocked"] or account["trade_suspended_by_user"]:
+        return False, "Alpaca account is blocked or suspended", None
+    if symbol in context["positions_by_symbol"]:
+        return False, "position already exists", None
+    snapshot = risk_snapshot(context)
+    if snapshot["open_positions"] >= CONFIG.max_open_positions:
+        return False, "maximum open positions reached", None
+    if snapshot["entries_today"] >= CONFIG.max_new_entries_per_day:
+        return False, "daily entry limit reached", None
+    if snapshot["gross_exposure_usd"] + capital_usd > CONFIG.max_gross_exposure_usd:
+        return False, "gross exposure limit would be exceeded", None
+    buying_power = account.get("buying_power")
+    if buying_power is not None and buying_power < capital_usd:
+        return False, "insufficient buying power", None
+    if side == "sell" and not CONFIG.allow_shorting:
+        return False, "shorting is disabled", None
+    try:
+        asset = api.get_asset(symbol)
+    except Exception as exc:
+        return False, f"could not verify asset: {exc}", None
+    if not bool(object_value(asset, "tradable", False)):
+        return False, "asset is not tradable", asset
+    if side == "sell":
+        if not bool(object_value(asset, "shortable", False)):
+            return False, "asset is not shortable", asset
+        if not bool(object_value(asset, "easy_to_borrow", False)):
+            return False, "asset is not easy to borrow", asset
+    return True, "ok", asset
 
-    if not STORAGE.queue_exit(symbol, reason):
-        log.info(f"Sell order for {symbol} ({reason}) is already queued.")
-        return False
 
-    log.info(f"Queued sell order for {symbol} due to {reason}.")
-    refresh_runtime_views()
-    return True
+def find_order_by_client_id(api: REST, client_order_id: str) -> Any | None:
+    getter = getattr(api, "get_order_by_client_order_id", None)
+    if getter is None:
+        return None
+    try:
+        return getter(client_order_id)
+    except APIError as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 404 or "not found" in str(exc).lower():
+            return None
+        raise
+
+
+def wait_for_order(api: REST, order: Any) -> Any:
+    deadline = time.monotonic() + CONFIG.order_fill_timeout_seconds
+    current = order
+    while str(object_value(current, "status", "")) not in ORDER_TERMINAL_STATUSES and time.monotonic() < deadline:
+        time.sleep(1)
+        current = api.get_order(str(object_value(current, "id")))
+    return current
+
+
+def place_entry_order(
+    api: REST,
+    trade: dict[str, Any],
+    capital_usd: float,
+    context: dict[str, Any],
+) -> tuple[bool, str]:
+    trade_id = str(trade.get("trade_id") or "")
+    symbol = str(trade.get("ticker") or "").upper()
+    side = str(trade.get("direction") or "")
+    allowed, reason, asset = check_entry_risk(api, trade, capital_usd, context)
+    if not allowed:
+        return False, reason
+    if CONFIG.dry_run:
+        STORAGE.update_signal_status(trade_id, "dry_run", f"would submit {side} ${capital_usd:.2f} of {symbol}")
+        STORAGE.mark_trades_seen([trade_id])
+        log.info("DRY RUN: would submit %s entry for %s with $%.2f", side, symbol, capital_usd)
+        return True, "dry run"
+    try:
+        latest_price = safe_float(api.get_latest_trade(symbol).price)
+        if latest_price is None or latest_price <= 0:
+            return False, "latest price was invalid"
+        if side == "sell" or not bool(object_value(asset, "fractionable", False)):
+            qty: float | int = int(capital_usd / latest_price)
+            if qty < 1:
+                return False, "capital is too low for one whole share"
+        else:
+            qty = round(capital_usd / latest_price, 4)
+            if qty < 0.0001:
+                return False, "calculated fractional quantity is too small"
+        if side == "sell":
+            tp_price = round(latest_price * (1 - CONFIG.take_profit_percent / 100), 2)
+            sl_price = round(latest_price * (1 + CONFIG.stop_loss_percent / 100), 2)
+        else:
+            tp_price = round(latest_price * (1 + CONFIG.take_profit_percent / 100), 2)
+            sl_price = round(latest_price * (1 - CONFIG.stop_loss_percent / 100), 2)
+        client_order_id = make_client_order_id(trade_id)
+        order = find_order_by_client_id(api, client_order_id)
+        if order is None:
+            order = api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type="market",
+                time_in_force="day",
+                client_order_id=client_order_id,
+            )
+        STORAGE.record_trade_submission(trade, order, latest_price, tp_price, sl_price)
+        final_order = wait_for_order(api, order)
+        STORAGE.update_entry_order(
+            final_order,
+            take_profit_percent=CONFIG.take_profit_percent,
+            stop_loss_percent=CONFIG.stop_loss_percent,
+        )
+        status = str(object_value(final_order, "status", "unknown"))
+        if status in {"rejected", "canceled", "expired"}:
+            return False, f"entry order ended as {status}"
+        return True, status
+    except Exception as exc:
+        log.error("Failed to place entry for %s: %s", symbol, exc)
+        return False, str(exc)
+
+
+def reconcile_orders(api: REST) -> tuple[int, int]:
+    entry_count = 0
+    exit_count = 0
+    for row in STORAGE.get_unreconciled_entries():
+        try:
+            order = api.get_order(row["alpaca_order_id"])
+            STORAGE.update_entry_order(
+                order,
+                take_profit_percent=CONFIG.take_profit_percent,
+                stop_loss_percent=CONFIG.stop_loss_percent,
+            )
+            entry_count += 1
+        except Exception as exc:
+            log.warning("Could not reconcile entry order %s: %s", row["alpaca_order_id"], exc)
+    for row in STORAGE.get_unreconciled_exits():
+        try:
+            order = api.get_order(row["exit_order_id"])
+            STORAGE.update_exit_order(order)
+            exit_count += 1
+        except Exception as exc:
+            log.warning("Could not reconcile exit order %s: %s", row["exit_order_id"], exc)
+    return entry_count, exit_count
+
+
+def submit_managed_exit(
+    api: REST,
+    trade: dict[str, Any],
+    reason: str,
+    position: Any,
+) -> tuple[bool, str]:
+    history_id = int(trade["id"])
+    symbol = str(trade["ticker"])
+    if CONFIG.dry_run:
+        log.info("DRY RUN: would exit managed %s position because %s", symbol, reason)
+        return True, "dry run"
+    entry_side = str(trade["side"])
+    exit_side = "buy" if entry_side == "sell" else "sell"
+    bot_qty = abs(safe_float(trade.get("filled_qty") or trade.get("order_qty"), 0.0) or 0.0)
+    position_qty = abs(safe_float(object_value(position, "qty"), 0.0) or 0.0)
+    qty = min(bot_qty, position_qty)
+    if qty <= 0:
+        return False, "managed quantity is unavailable"
+    client_order_id = make_client_order_id(str(history_id), prefix="insider-exit")
+    try:
+        order = find_order_by_client_id(api, client_order_id)
+        if order is None:
+            order = api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=exit_side,
+                type="market",
+                time_in_force="day",
+                client_order_id=client_order_id,
+            )
+        STORAGE.record_exit_submission(history_id, order, reason)
+        final_order = wait_for_order(api, order)
+        STORAGE.update_exit_order(final_order)
+        status = str(object_value(final_order, "status", "unknown"))
+        return status not in {"rejected", "canceled", "expired"}, status
+    except Exception as exc:
+        return False, str(exc)
+
+
+def queue_pending_trade(trade: dict[str, Any]) -> bool:
+    return STORAGE.queue_entry(trade, expiry_hours=CONFIG.queue_expiry_hours)
+
+
+def queue_pending_exit(trade: dict[str, Any], reason: str) -> bool:
+    exit_side = "buy" if trade.get("side") == "sell" else "sell"
+    return STORAGE.queue_exit(
+        str(trade["ticker"]),
+        reason,
+        trade_history_id=int(trade["id"]),
+        qty=safe_float(trade.get("filled_qty") or trade.get("order_qty")),
+        side=exit_side,
+        expiry_hours=CONFIG.queue_expiry_hours,
+    )
 
 
 def execute_pending_orders(
     api: REST,
-    pending_orders: dict,
     capital_per_trade_usd: float | None,
+    context: dict[str, Any],
 ) -> bool:
-    pending = ensure_pending_structure(pending_orders)
+    STORAGE.expire_stale_queue()
+    pending = STORAGE.load_pending_orders(due_only=True)
     modified = False
+    for queued in pending["sell"]:
+        queue_id = int(queued["queue_id"])
+        history_id = queued.get("trade_history_id")
+        trade = STORAGE.get_trade_by_id(int(history_id)) if history_id is not None else None
+        if trade is None:
+            STORAGE.record_queue_attempt(queue_id)
+            STORAGE.record_queue_failure(
+                queue_id,
+                "managed trade no longer exists",
+                max_attempts=CONFIG.max_queue_attempts,
+                retry_base_seconds=CONFIG.queue_retry_base_seconds,
+            )
+            continue
+        position = context["positions_by_symbol"].get(str(trade["ticker"]))
+        STORAGE.record_queue_attempt(queue_id)
+        if position is None:
+            STORAGE.record_queue_failure(
+                queue_id,
+                "broker position not found",
+                max_attempts=CONFIG.max_queue_attempts,
+                retry_base_seconds=CONFIG.queue_retry_base_seconds,
+            )
+            continue
+        success, note = submit_managed_exit(api, trade, str(queued.get("reason") or "queued exit"), position)
+        if success:
+            STORAGE.mark_queue_executed(queue_id)
+            modified = True
+        else:
+            STORAGE.record_queue_failure(
+                queue_id,
+                note,
+                max_attempts=CONFIG.max_queue_attempts,
+                retry_base_seconds=CONFIG.queue_retry_base_seconds,
+            )
 
-    sell_orders = pending.get('sell', [])
-    if sell_orders:
-        for order in sell_orders:
-            queue_id = order.get("queue_id")
-            symbol = order.get('symbol')
-            reason = order.get('reason', 'pending sell')
-            if not symbol:
-                continue
-            if queue_id:
-                STORAGE.record_queue_attempt(int(queue_id))
-            try:
-                exit_price = api.get_latest_trade(symbol).price
-                api.close_position(symbol)
-                log.info(f"Executed queued sell for {symbol} ({reason}).")
-                update_trade_exit_in_history(symbol, reason, exit_price)
-                if queue_id:
-                    STORAGE.mark_queue_executed(int(queue_id))
-                heartbeat("order", note=f"sell:{symbol}")
-                modified = True
-            except Exception as e:
-                log.error(f"Failed to execute queued sell for {symbol}: {e}")
-
-    buy_orders = pending.get('buy', [])
-    if buy_orders:
-        if capital_per_trade_usd is None:
-            log.error("Cannot execute queued buy orders without capital information. Will retry later.")
-            return modified
-        try:
-            open_positions = {p.symbol for p in api.list_positions()}
-        except Exception as e:
-            log.error(f"Could not refresh open positions before executing queued buys: {e}")
-            open_positions = set()
-
-        for order in buy_orders:
-            trade = dict(order)
-            queue_id = trade.get("queue_id")
-            symbol = trade.get('ticker')
-            if not symbol:
-                log.warning("Skipping queued buy order without a ticker symbol.")
-                continue
-            if symbol in open_positions:
-                log.info(f"Skipping queued buy for {symbol}: position already open.")
-                STORAGE.update_signal_status(trade.get("trade_id"), "skipped", "position already open during queued execution")
-                if trade.get("trade_id"):
-                    STORAGE.mark_trade_seen(trade["trade_id"])
-                if queue_id:
-                    STORAGE.mark_queue_executed(int(queue_id))
-                modified = True
-                continue
-
-            if queue_id:
-                STORAGE.record_queue_attempt(int(queue_id))
-
-            insider_date = trade.get('insider_date')
-            if isinstance(insider_date, str):
-                try:
-                    trade['insider_date'] = datetime.date.fromisoformat(insider_date)
-                except ValueError:
-                    pass
-
-            trade.setdefault('direction', 'buy')
-            success = place_simple_market_order(api, trade, capital_per_trade_usd)
-            if success:
-                open_positions.add(symbol)
-                if queue_id:
-                    STORAGE.mark_queue_executed(int(queue_id))
-                heartbeat("order", note=f"buy:{symbol}")
-                modified = True
-                time.sleep(2)
-
-    refresh_runtime_views()
+    if capital_per_trade_usd is None:
+        return modified
+    for trade in pending["buy"]:
+        queue_id = int(trade["queue_id"])
+        STORAGE.record_queue_attempt(queue_id)
+        success, note = place_entry_order(api, dict(trade), capital_per_trade_usd, context)
+        if success:
+            STORAGE.mark_queue_executed(queue_id)
+            if trade.get("ticker") not in context["positions_by_symbol"]:
+                context["positions_by_symbol"][trade["ticker"]] = object()
+                context["projected_open_positions"] += 1
+                context["reserved_notional_usd"] += capital_per_trade_usd
+            modified = True
+        else:
+            status = STORAGE.record_queue_failure(
+                queue_id,
+                note,
+                max_attempts=CONFIG.max_queue_attempts,
+                retry_base_seconds=CONFIG.queue_retry_base_seconds,
+            )
+            if status != "pending":
+                STORAGE.update_signal_status(trade.get("trade_id"), "failed", note)
+    refresh_runtime_views(context)
     return modified
 
 
 def process_insider_trades(
     api: REST,
     is_market_open: bool,
-    pending_orders: dict,
     capital_per_trade_usd: float | None,
+    context: dict[str, Any],
 ) -> bool:
-    pending = ensure_pending_structure(pending_orders)
-    pending_buy_ids = {order.get('trade_id') for order in pending['buy']}
-    company_history_cache: dict[str, list[dict]] = {}
-
-    try:
-        open_positions = {p.symbol for p in api.list_positions()}
-    except Exception as e:
-        log.error(f"Could not load open positions: {e}")
-        open_positions = set()
-
-    can_trade_now = is_market_open and capital_per_trade_usd is not None
-
-    seen_trade_ids = load_seen_trade_ids()
-    latest_trades_df = fetch_insider_trades()
-    RUNTIME_STATE.set_latest_scrape_rows(len(latest_trades_df.index))
-    heartbeat("scrape", note=f"rows={len(latest_trades_df)}")
-    if latest_trades_df.empty:
-        log.info("No insider trades retrieved in this scan.")
+    latest = fetch_insider_trades()
+    RUNTIME_STATE.set_latest_scrape_rows(len(latest.index))
+    heartbeat("scrape", note=f"rows={len(latest)}")
+    if latest.empty:
         return False
 
-    new_unseen_trades = latest_trades_df[~latest_trades_df['trade_id'].isin(seen_trade_ids)]
-    if new_unseen_trades.empty:
-        log.info("No new insider trades found since the last scan.")
+    if STORAGE.get_meta("signal_baseline_complete") != "true":
+        if STORAGE.count_seen_trades() == 0:
+            baseline_ids: list[str] = []
+            for _, row in latest.iterrows():
+                trade = row.to_dict()
+                STORAGE.upsert_signal(trade, status="baseline", note="first-run safety baseline")
+                baseline_ids.append(trade["trade_id"])
+            STORAGE.mark_trades_seen(baseline_ids)
+            STORAGE.set_meta("signal_baseline_complete", "true")
+            log.warning("First-run baseline recorded %s signals without trading them.", len(baseline_ids))
+            heartbeat("baseline", note=f"recorded={len(baseline_ids)}")
+            return True
+        STORAGE.set_meta("signal_baseline_complete", "true")
+
+    seen = STORAGE.load_seen_trade_ids()
+    unseen = latest[~latest["trade_id"].isin(seen)]
+    if unseen.empty:
         return False
-
-    log.info(f"Found {len(new_unseen_trades)} new insider trades to evaluate.")
-
-    queued_count = 0
-    for _, trade in new_unseen_trades.iterrows():
-        trade_info = trade.to_dict()
-        if not trade_info.get("filter_reason"):
-            trade_info = resolve_direction_with_company_history(trade_info, company_history_cache)
-        trade_id = trade_info['trade_id']
-        ticker = trade_info['ticker']
-        STORAGE.upsert_signal(trade_info)
-
-        if trade_info.get("filter_reason"):
-            STORAGE.update_signal_status(trade_id, "filtered", trade_info["filter_reason"])
-            STORAGE.mark_trade_seen(trade_id)
-            log.info(f"Filtered {ticker} ({trade_id}) as {trade_info['filter_reason']}.")
-            continue
-
-        if trade_info.get("direction") is None:
-            STORAGE.update_signal_status(trade_id, "filtered", "unsupported transaction type")
-            STORAGE.mark_trade_seen(trade_id)
-            continue
-
-        if ticker in open_positions:
-            log.info(f"Skipping {ticker}: position already open.")
-            STORAGE.update_signal_status(trade_id, "skipped", "position already open")
-            STORAGE.mark_trade_seen(trade_id)
-            continue
-        if trade_id in pending_buy_ids:
-            log.info(f"Skipping {ticker}: trade {trade_id} already queued.")
-            continue
-
-        if can_trade_now:
-            if capital_per_trade_usd is None:
-                log.error("Capital per trade missing despite market open; cannot trade now.")
-                STORAGE.update_signal_status(trade_id, "observed", "capital unavailable")
-                heartbeat("order", ok=False, note=f"buy:{ticker}-no_capital")
-                continue
-            success = place_simple_market_order(api, trade_info, capital_per_trade_usd)
-            if success:
-                open_positions.add(ticker)
-                heartbeat("order", note=f"buy:{ticker}")
-                time.sleep(2)
-            else:
-                STORAGE.update_signal_status(trade_id, "observed", "submission failed; will retry")
-                log.error(f"Failed to submit order for {ticker} during market hours.")
-        else:
-            if queue_pending_trade(pending_orders, trade_info):
-                pending_buy_ids.add(trade_id)
-                queued_count += 1
-
-    if queued_count:
-        log.info(f"Queued {queued_count} trades for the next market session.")
-
-    refresh_runtime_views()
-    return queued_count > 0
-
-def place_simple_market_order(api: REST, trade_details, capital_usd: float) -> bool:
-    """
-    Places a market order.
-    - Tries fractional for buys, falls back to whole shares if asset is not fractionable.
-    - Uses whole shares for sells.
-    """
-    if isinstance(trade_details, pd.Series):
-        trade_info = trade_details.to_dict()
-    else:
-        trade_info = dict(trade_details)
-
-    symbol = trade_info.get('ticker'); side = trade_info.get('direction')
-    if not symbol or not side:
-        log.error("Trade details missing symbol or side. Cannot submit order.")
-        return False
-    try:
-        latest_price = api.get_latest_trade(symbol).price
-    except Exception as e:
-        log.error(f"Could not get latest price for {symbol}. Skipping. Error: {e}"); return False
-
-    if side == 'buy':
-        qty = round(capital_usd / latest_price, 4)
-        if qty <= 0.0001:
-            log.warning(f"Capital of ${capital_usd:.2f} is too low to trade {symbol}."); return False
-    elif side == 'sell':
-        qty = int(capital_usd / latest_price)
-        if qty < 1:
-            log.warning(f"Capital of ${capital_usd:.2f} is too low to short 1 share of {symbol}."); return False
-    else:
-        log.error(f"Unknown side '{side}' for {symbol}."); return False
-
-    if side == 'buy':
-        tp_price = round(latest_price * (1 + TAKE_PROFIT_PERCENT / 100), 2)
-    else:
-        tp_price = round(latest_price * (1 - TAKE_PROFIT_PERCENT / 100), 2)
-    sl_price = None
-    
-    log.info(
-        "Submitting %s MARKET order for %s shares of %s from %s [%s | %s].",
-        side,
-        qty,
-        symbol,
-        trade_info.get('insider') or 'unknown insider',
-        trade_info.get('relationship') or 'unknown relationship',
-        trade_info.get('transaction_type') or 'unknown transaction',
+    cache: dict[str, list[dict[str, Any]]] = {}
+    pending = STORAGE.load_pending_orders()
+    pending_symbols = {str(item.get("ticker")) for item in pending["buy"]}
+    positions = set(context["positions_by_symbol"])
+    entry_slots = max(
+        0,
+        CONFIG.max_new_entries_per_day - STORAGE.count_entries_on_market_date() - len(pending["buy"]),
     )
-    try:
-        # --- PLAN A: Submit the order as calculated ---
-        order = api.submit_order(symbol=symbol, qty=qty, side=side, type='market', time_in_force='day')
-        log_trade_to_history(trade_info, order, latest_price, tp_price, sl_price)
-        return True
-    except APIError as e:
-        # --- PLAN B: If it's a "not fractionable" error on a buy, retry with whole shares ---
-        if "not fractionable" in str(e).lower() and side == 'buy':
-            log.warning(f"Asset {symbol} is not fractionable. Retrying with whole shares.")
-            whole_qty = int(qty)
-            if whole_qty < 1:
-                log.error(f"Cannot retry {symbol}: not enough capital for 1 whole share.")
-                return False
-            try:
-                # Retry the order with the new integer quantity
-                log.info(f"Submitting {side} MARKET order for {whole_qty} (whole) shares of {symbol}.")
-                order = api.submit_order(symbol=symbol, qty=whole_qty, side=side, type='market', time_in_force='day')
-                log_trade_to_history(trade_info, order, latest_price, tp_price, sl_price)
-                return True
-            except Exception as retry_e:
-                log.error(f"Retry attempt for {symbol} also failed: {retry_e}")
-                return False
+    changed = False
+    for _, row in unseen.iterrows():
+        trade = row.to_dict()
+        if not trade.get("filter_reason"):
+            trade = resolve_direction_with_company_history(trade, cache)
+        trade_id = trade["trade_id"]
+        symbol = trade["ticker"]
+        STORAGE.upsert_signal(trade)
+        if trade.get("filter_reason"):
+            STORAGE.update_signal_status(trade_id, "filtered", trade["filter_reason"])
+            STORAGE.mark_trades_seen([trade_id])
+            continue
+        if trade.get("direction") not in {"buy", "sell"}:
+            STORAGE.update_signal_status(trade_id, "filtered", "unsupported transaction type")
+            STORAGE.mark_trades_seen([trade_id])
+            continue
+        if trade["direction"] == "sell" and not CONFIG.allow_shorting:
+            STORAGE.update_signal_status(trade_id, "filtered", "shorting disabled")
+            STORAGE.mark_trades_seen([trade_id])
+            continue
+        if symbol in positions or symbol in pending_symbols:
+            STORAGE.update_signal_status(trade_id, "skipped", "position or entry already exists")
+            STORAGE.mark_trades_seen([trade_id])
+            continue
+        if entry_slots <= 0:
+            STORAGE.update_signal_status(trade_id, "deferred", "daily entry slots exhausted")
+            break
+        if is_market_open and capital_per_trade_usd is not None:
+            success, note = place_entry_order(api, trade, capital_per_trade_usd, context)
+            if success:
+                positions.add(symbol)
+                if symbol not in context["positions_by_symbol"]:
+                    context["positions_by_symbol"][symbol] = object()
+                    context["projected_open_positions"] += 1
+                    context["reserved_notional_usd"] += capital_per_trade_usd
+                entry_slots -= 1
+                changed = True
+                heartbeat("order", note=f"entry:{symbol}:{note}")
+            elif note in {
+                "maximum open positions reached",
+                "daily entry limit reached",
+                "gross exposure limit would be exceeded",
+            }:
+                STORAGE.update_signal_status(trade_id, "deferred", note)
+                break
+            else:
+                STORAGE.update_signal_status(trade_id, "observed", note)
         else:
-            # For any other error, just log it and fail.
-            log.error(f"Alpaca API error placing order for {symbol}: {e}")
-            return False
-    except Exception as e:
-        log.error(f"An unknown error occurred placing order for {symbol}: {e}")
-        return False
+            if queue_pending_trade(trade):
+                pending_symbols.add(symbol)
+                entry_slots -= 1
+                changed = True
+    refresh_runtime_views(context)
+    return changed
 
-def check_and_manage_positions(api: REST, trade_history_df: pd.DataFrame, is_market_open: bool, pending_orders: dict) -> bool:
-    log.info("Checking open positions for exit signals...")
-    try:
-        positions = api.list_positions()
-    except Exception as e:
-        log.error(f"Could not list open positions: {e}")
-        return False
 
-    if not positions:
-        log.info("No open positions to manage.")
-        return False
-
-    pending_modified = False
-
-    for pos in positions:
+def manage_positions(api: REST, context: dict[str, Any]) -> bool:
+    changed = False
+    now = dt.datetime.now(dt.timezone.utc)
+    for trade in STORAGE.get_managed_open_trades():
+        symbol = str(trade["ticker"])
+        position = context["positions_by_symbol"].get(symbol)
+        if position is None:
+            log.warning("Managed trade %s has no matching broker position; no exit was submitted.", trade["id"])
+            continue
+        if trade.get("exit_order_id") and str(trade.get("exit_order_status") or "") not in ORDER_TERMINAL_STATUSES:
+            continue
         try:
-            current_price = api.get_latest_trade(pos.symbol).price
-            trade_record = trade_history_df[trade_history_df['ticker'] == pos.symbol].tail(1)
-            if trade_record.empty or 'take_profit_price' not in trade_record.columns:
+            current_price = safe_float(api.get_latest_trade(symbol).price)
+            if current_price is None:
                 continue
+            tp_price = safe_float(trade.get("take_profit_price"))
+            sl_price = safe_float(trade.get("stop_loss_price"))
+            side = str(trade.get("side"))
+            reason = None
+            if side == "sell":
+                if tp_price is not None and current_price <= tp_price:
+                    reason = f"take profit at ${tp_price:.2f}"
+                elif sl_price is not None and current_price >= sl_price:
+                    reason = f"stop loss at ${sl_price:.2f}"
+            else:
+                if tp_price is not None and current_price >= tp_price:
+                    reason = f"take profit at ${tp_price:.2f}"
+                elif sl_price is not None and current_price <= sl_price:
+                    reason = f"stop loss at ${sl_price:.2f}"
+            filled_at = normalize_utc_datetime(
+                dt.datetime.fromisoformat(str(trade["filled_at_utc"]).replace("Z", "+00:00"))
+            )
+            if reason is None and filled_at is not None and now - filled_at >= dt.timedelta(days=CONFIG.max_hold_days):
+                reason = f"maximum hold of {CONFIG.max_hold_days} days"
+            if reason:
+                success, note = submit_managed_exit(api, trade, reason, position)
+                if success:
+                    changed = True
+                    heartbeat("order", note=f"exit:{symbol}:{note}")
+                elif queue_pending_exit(trade, reason):
+                    changed = True
+                    heartbeat("order", ok=False, note=f"queued_exit:{symbol}:{note}")
+        except Exception as exc:
+            log.error("Error managing bot-owned position %s: %s", symbol, exc)
+    return changed
 
-            try:
-                tp_price = float(trade_record['take_profit_price'].iloc[0])
-            except (TypeError, ValueError):
-                log.warning(f"Invalid take profit price for {pos.symbol}; skipping exit check.")
-                continue
 
-            exit_reason = None
-            if pos.side == 'long' and current_price >= tp_price:
-                exit_reason = f"take profit at ${tp_price}"
-            elif pos.side == 'short' and current_price <= tp_price:
-                exit_reason = f"take profit at ${tp_price}"
+def fetch_performance_snapshot() -> dict[str, Any]:
+    headers = {
+        "APCA-API-KEY-ID": CONFIG.api_key,
+        "APCA-API-SECRET-KEY": CONFIG.secret_key,
+    }
+    trading_url = f"{CONFIG.base_url}/v2/account/portfolio/history"
+    response = SESSION.get(
+        trading_url,
+        headers=headers,
+        params={
+            "period": f"{CONFIG.performance_lookback_days}D",
+            "timeframe": "1D",
+            "intraday_reporting": "market_hours",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    history = response.json()
+    account_by_date: dict[str, float] = {}
+    for timestamp, equity in zip(history.get("timestamp") or [], history.get("equity") or []):
+        value = safe_float(equity)
+        if value is None or value <= 0:
+            continue
+        date = dt.datetime.fromtimestamp(int(timestamp), tz=dt.timezone.utc).date().isoformat()
+        account_by_date[date] = value
+    if len(account_by_date) < 2:
+        raise ValueError("Alpaca portfolio history returned fewer than two usable points")
+    start_date = min(account_by_date)
+    bars_response = SESSION.get(
+        f"https://data.alpaca.markets/v2/stocks/{CONFIG.benchmark_symbol}/bars",
+        headers=headers,
+        params={
+            "timeframe": "1Day",
+            "start": start_date,
+            "limit": 1000,
+            "adjustment": "all",
+            "feed": "iex",
+            "sort": "asc",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    bars_response.raise_for_status()
+    benchmark_by_date: dict[str, float] = {}
+    for bar in bars_response.json().get("bars") or []:
+        close = safe_float(bar.get("c"))
+        if close is not None and close > 0 and bar.get("t"):
+            benchmark_by_date[str(bar["t"])[:10]] = close
+    common_dates = sorted(set(account_by_date) & set(benchmark_by_date))
+    if len(common_dates) < 2:
+        raise ValueError("benchmark history did not overlap account history")
+    first_date = common_dates[0]
+    base_equity = account_by_date[first_date]
+    base_benchmark = benchmark_by_date[first_date]
+    points = [
+        {
+            "date": date,
+            "account_return_pct": round((account_by_date[date] / base_equity - 1) * 100, 3),
+            "benchmark_return_pct": round((benchmark_by_date[date] / base_benchmark - 1) * 100, 3),
+        }
+        for date in common_dates
+    ]
+    account_return = points[-1]["account_return_pct"]
+    benchmark_return = points[-1]["benchmark_return_pct"]
+    return {
+        "benchmark_symbol": CONFIG.benchmark_symbol,
+        "account_return_pct": account_return,
+        "benchmark_return_pct": benchmark_return,
+        "alpha_pct": round(account_return - benchmark_return, 3),
+        "lookback_label": f"{first_date} to {common_dates[-1]}",
+        "updated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "points": points,
+        "trade_summary": STORAGE.get_performance_summary(),
+        "scope_note": "Alpaca account equity versus a buy-and-hold benchmark; other activity in the account is included.",
+    }
 
-            if exit_reason:
-                if is_market_open:
-                    try:
-                        api.close_position(pos.symbol)
-                        log.info(f"Closed {pos.symbol} due to {exit_reason}.")
-                        update_trade_exit_in_history(pos.symbol, exit_reason, current_price)
-                        heartbeat("order", note=f"exit:{pos.symbol}")
-                        pending_modified = True
-                    except Exception as e:
-                        log.error(f"Failed to close {pos.symbol}: {e}")
-                        if queue_pending_sell(pending_orders, pos.symbol, exit_reason):
-                            heartbeat("order", note=f"queue_exit:{pos.symbol}")
-                            pending_modified = True
-                else:
-                    if queue_pending_sell(pending_orders, pos.symbol, exit_reason):
-                        heartbeat("order", note=f"queue_exit:{pos.symbol}")
-                        pending_modified = True
-        except Exception as e:
-            log.error(f"Error managing position for {pos.symbol}: {e}")
 
-    return pending_modified
-
-# --------------------------------------------------
-# 3. Main Execution Loop
-# --------------------------------------------------
-if __name__ == '__main__':
+def initialize_runtime() -> REST:
     STORAGE.initialize()
-    refresh_trade_history_metrics()
+    heartbeat("storage", note="sqlite initialized")
+    RUNTIME_STATE.set_mode(
+        {
+            "dry_run": CONFIG.dry_run,
+            "paper_account": CONFIG.is_paper_account,
+            "shorting_enabled": CONFIG.allow_shorting,
+            "live_trading_enabled": CONFIG.allow_live_trading,
+        }
+    )
     refresh_runtime_views()
     if CONFIG.monitoring_enabled:
-        try:
-            start_monitoring_server(
-                RUNTIME_STATE,
-                host=CONFIG.monitoring_host,
-                port=CONFIG.monitoring_port,
-                log=log,
-            )
-            log.info(
-                "Monitoring server listening on http://%s:%s",
-                CONFIG.monitoring_host,
-                CONFIG.monitoring_port,
-            )
-        except Exception as exc:
-            log.error(f"Failed to start monitoring server: {exc}")
-
-    api = REST(key_id=API_KEY, secret_key=SECRET_KEY, base_url=BASE_URL)
+        start_monitoring_server(
+            RUNTIME_STATE,
+            host=CONFIG.monitoring_host,
+            port=CONFIG.monitoring_port,
+            log=log,
+            token=CONFIG.monitoring_token,
+        )
+        log.info("Monitoring server listening on http://%s:%s", CONFIG.monitoring_host, CONFIG.monitoring_port)
+    api = REST(
+        key_id=CONFIG.api_key,
+        secret_key=CONFIG.secret_key,
+        base_url=CONFIG.base_url,
+        api_version="v2",
+    )
     try:
-        orig_request = api._session.request
-        api._session.request = functools.partial(orig_request, timeout=REQUEST_TIMEOUT)
-        log.info("Applied HTTP timeout to Alpaca session.")
+        original_request = api._session.request
+        api._session.request = functools.partial(original_request, timeout=REQUEST_TIMEOUT)
     except Exception:
-        log.warning("Could not attach timeout to Alpaca session; continuing anyway.")
+        log.warning("Could not attach a timeout to the Alpaca SDK session.")
+    return api
 
-    log.info("--- Starting Continuous Insider Trading Bot with Smart Error Handling ---")
-    log.info("State directory: %s", CONFIG.state_dir)
-    log.info("SQLite state DB: %s", STATE_DB_PATH)
-    log.info("Trade history file: %s", TRADE_HISTORY_CSV)
-    log.info("Pending orders file: %s", PENDING_ORDERS_JSON)
 
-    last_insider_scan = datetime.datetime.min
-    last_position_check = datetime.datetime.min
-
+def run() -> None:
+    api = initialize_runtime()
+    log.info(
+        "Starting Insider Edge (dry_run=%s, paper=%s, shorting=%s)",
+        CONFIG.dry_run,
+        CONFIG.is_paper_account,
+        CONFIG.allow_shorting,
+    )
+    last_scan = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    last_position_check = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    last_performance_refresh = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     while True:
+        cycle_start = dt.datetime.now(dt.timezone.utc)
         heartbeat("loop_start")
-        cycle_start = datetime.datetime.utcnow()
-        pending_orders = load_pending_orders()
-        pending_modified = False
         is_market_open = False
-        next_open_at: datetime.datetime | None = None
-
+        next_open_at: dt.datetime | None = None
+        clock_available = False
+        context: dict[str, Any] | None = None
         try:
             try:
                 clock = api.get_clock()
-                is_market_open = clock.is_open
+                is_market_open = bool(clock.is_open)
                 next_open_at = normalize_utc_datetime(getattr(clock, "next_open", None))
+                clock_available = True
                 RUNTIME_STATE.set_market_open(is_market_open)
-                log.info(f"Market open status: {is_market_open}")
                 heartbeat("alpaca_clock", note="open" if is_market_open else "closed")
-            except Exception as e:
-                log.error(f"Could not retrieve market clock: {e}")
+                context = get_broker_context(api)
+                heartbeat("broker_state", note=f"positions={len(context['positions'])}")
+            except Exception as exc:
                 RUNTIME_STATE.set_market_open(None)
-                heartbeat("alpaca_clock", ok=False, note=str(e))
-                is_market_open = False
+                heartbeat("alpaca_clock", ok=False, note=str(exc))
+                log.error("Broker state is unavailable; entries and exits are paused: %s", exc)
 
-            capital_per_trade_usd: float | None = None
-            if is_market_open:
-                log.info("Step: fetch FX rate")
-                usd_per_czk = get_usd_per_czk()
-                if usd_per_czk is None:
-                    log.error("Cannot compute USD capital this cycle; deferring USD-denominated actions.")
-                    heartbeat("fx", ok=False, note="rate_unavailable")
+            if context is not None:
+                entries, exits = reconcile_orders(api)
+                heartbeat("reconcile", note=f"entries={entries},exits={exits}")
+
+            capital_usd = None
+            if is_market_open and context is not None:
+                rate = get_usd_per_czk()
+                if rate is not None:
+                    capital_usd = CONFIG.trade_capital_czk * rate
+                    heartbeat("fx", note=f"capital_usd={capital_usd:.2f}")
                 else:
-                    capital_per_trade_usd = TRADE_CAPITAL_CZK * usd_per_czk
-                    log.info(f"{TRADE_CAPITAL_CZK} CZK ~= ${capital_per_trade_usd:.2f} USD")
-                    heartbeat("fx", note=f"{usd_per_czk:.4f}")
-            else:
-                heartbeat("fx", note="market_closed")
+                    heartbeat("fx", ok=False, note="rate unavailable")
 
-            if is_market_open:
+            if is_market_open and context is not None:
                 try:
-                    executed_pending = execute_pending_orders(api, pending_orders, capital_per_trade_usd)
-                    if executed_pending:
-                        pending_modified = True
-                        heartbeat("pending_orders", note="executed")
-                    else:
-                        if capital_per_trade_usd is None and pending_orders.get('buy'):
-                            heartbeat("pending_orders", ok=False, note="no_capital")
-                        else:
-                            heartbeat("pending_orders", note="no_changes")
-                except Exception as e:
-                    log.error(f"Error while processing queued orders: {e}")
-                    heartbeat("pending_orders", ok=False, note=str(e))
-            else:
-                if pending_orders.get('buy') or pending_orders.get('sell'):
-                    heartbeat("pending_orders", note="market_closed_with_queue")
-                else:
-                    heartbeat("pending_orders", note="market_closed")
+                    execute_pending_orders(api, capital_usd, context)
+                    heartbeat("pending_orders", note="processed due queue")
+                except Exception as exc:
+                    heartbeat("pending_orders", ok=False, note=str(exc))
+                    log.error("Queued-order processing failed: %s", exc)
 
-            ran_insider_scan = False
-            insider_scan_interval_minutes = effective_insider_scan_interval_minutes(is_market_open)
-            if (cycle_start - last_insider_scan) >= datetime.timedelta(minutes=insider_scan_interval_minutes):
-                ran_insider_scan = True
+            if (
+                clock_available
+                and context is not None
+                and cycle_start - last_scan >= dt.timedelta(minutes=CONFIG.insider_scan_interval_minutes)
+            ):
                 try:
-                    if process_insider_trades(api, is_market_open, pending_orders, capital_per_trade_usd):
-                        pending_modified = True
-                except Exception as e:
-                    log.error(f"Error while processing insider trades: {e}")
-                    heartbeat("scrape", ok=False, note=str(e))
+                    process_insider_trades(api, is_market_open, capital_usd, context)
+                except Exception as exc:
+                    heartbeat("scrape", ok=False, note=str(exc))
+                    log.error("Insider scan failed: %s", exc, exc_info=True)
                 finally:
-                    last_insider_scan = cycle_start
-            if not ran_insider_scan:
-                heartbeat("scrape", note="skipped_interval")
+                    last_scan = cycle_start
 
-            run_position_check = is_market_open and (
-                (cycle_start - last_position_check)
-                >= datetime.timedelta(minutes=effective_position_check_interval_minutes())
-            )
-            if run_position_check:
+            if (
+                is_market_open
+                and context is not None
+                and cycle_start - last_position_check >= dt.timedelta(minutes=CONFIG.position_check_interval_minutes)
+            ):
                 try:
-                    trade_history_df = load_trade_history()
-                    if not trade_history_df.empty and check_and_manage_positions(api, trade_history_df, True, pending_orders):
-                        pending_modified = True
-                        heartbeat("manage_positions", note="executed")
-                    elif trade_history_df.empty:
-                        heartbeat("manage_positions", note="no_history")
-                    else:
-                        heartbeat("manage_positions", note="no_changes")
-                except Exception as e:
-                    log.error(f"Error during position management: {e}")
-                    heartbeat("manage_positions", ok=False, note=str(e))
+                    manage_positions(api, context)
+                    heartbeat("manage_positions", note="checked bot-owned positions")
+                except Exception as exc:
+                    heartbeat("manage_positions", ok=False, note=str(exc))
+                    log.error("Position management failed: %s", exc, exc_info=True)
                 finally:
                     last_position_check = cycle_start
-            else:
-                heartbeat(
-                    "manage_positions",
-                    note="market_closed" if not is_market_open else "skipped_interval",
-                )
 
-        except Exception as loop_exception:
-            log.critical(f"Critical error in main loop: {loop_exception}", exc_info=True)
-            heartbeat("loop_exception", ok=False, note=str(loop_exception))
+            if context is not None and cycle_start - last_performance_refresh >= dt.timedelta(
+                minutes=CONFIG.performance_refresh_minutes
+            ):
+                try:
+                    RUNTIME_STATE.set_performance(fetch_performance_snapshot())
+                    heartbeat("performance", note=f"benchmark={CONFIG.benchmark_symbol}")
+                except Exception as exc:
+                    heartbeat("performance", ok=False, note=str(exc))
+                    log.warning("Performance refresh failed: %s", exc)
+                finally:
+                    last_performance_refresh = cycle_start
 
-        if pending_modified:
-            save_pending_orders(pending_orders)
-        else:
-            refresh_runtime_views()
+            refresh_runtime_views(context)
+            heartbeat("storage", note="runtime views refreshed")
+        except Exception as exc:
+            heartbeat("loop_exception", ok=False, note=str(exc))
+            log.critical("Unhandled main-loop error: %s", exc, exc_info=True)
 
-        pending_orders = load_pending_orders()
+        pending = STORAGE.load_pending_orders()
         sleep_seconds = compute_sleep_seconds(
             is_market_open=is_market_open,
-            pending_orders=pending_orders,
+            pending_orders=pending,
             next_open_at=next_open_at,
         )
-        market_state = "open" if is_market_open else "closed"
-        log.info(
-            f"Cycle complete. Sleeping for {sleep_seconds} seconds (market {market_state})."
-        )
-        heartbeat("sleep", note=f"{sleep_seconds}s_{market_state}")
+        heartbeat("sleep", note=f"{sleep_seconds}s")
         time.sleep(sleep_seconds)
+
+
+if __name__ == "__main__":
+    run()

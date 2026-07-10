@@ -16,7 +16,12 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-RUN mkdir -p /data/logs
+RUN groupadd --gid 10001 insider \
+    && useradd --uid 10001 --gid insider --create-home --shell /usr/sbin/nologin insider \
+    && mkdir -p /data/logs \
+    && chown -R insider:insider /data
+
+USER 10001:10001
 
 EXPOSE 8080
 

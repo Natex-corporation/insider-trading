@@ -1,0 +1,15 @@
+services:
+  insider-trading:
+    build:
+      context: .
+    container_name: insider-trading
+    restart: unless-stopped
+    read_only: true
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    tmpfs:
+      - /tmp

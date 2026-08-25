@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insider-edge"
+version = "1.0.0"
+description = "Automated SEC Form 4 insider trading bot with risk guardrails, SQLite state management, and real-time operations dashboard."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Tom Nazler", email = "nazlertom@gmail.com" },
+]
+keywords = [
+    "trading",
+    "alpaca",
+    "insider-trading",
+    "fintech",
+    "algorithmic-trading",
+    "dashboard",
+    "sqlite",
+    "docker",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "alpaca-trade-api==3.2.0",
+    "beautifulsoup4==4.15.0",
+    "pandas==3.0.3",
+    "requests==2.34.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.15.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/Natex-corporation/insider-trading"
+Repository = "https://github.com/Natex-corporation/insider-trading"
+Issues = "https://github.com/Natex-corporation/insider-trading/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.pytest-tmp"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = ["data", ".venv"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

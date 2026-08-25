@@ -1,4 +1,4 @@
-# Insider Edge
+﻿# Insider Edge
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -14,7 +14,7 @@ Designed for robust self-hosting on Linux, Docker, and TrueNAS SCALE with zero d
 
 ## 🏛️ System Architecture
 
-`mermaid
+```mermaid
 flowchart TD
     subgraph Ingestion ["Data Ingestion & Signal Extraction"]
         A[Finviz Insider Feed] -->|Scrape Recent Form 4s| B[Signal Deduplication & Freshness Filter]
@@ -45,7 +45,7 @@ flowchart TD
         I --> L[Prometheus Metrics /metrics]
         I --> M[Health Probes /healthz & /readyz]
     end
-`
+```
 
 ---
 
@@ -53,40 +53,40 @@ flowchart TD
 
 - **Automated SEC Form 4 Ingestion**: Continuously scrapes and parses real-time insider purchases and sales from Finviz with configurable page depth and lookback freshness thresholds.
 - **Multi-Layered Risk Management**:
-  - **Account & Position Caps**: Configurable maximum open positions (MAX_OPEN_POSITIONS) and daily entry throttle (MAX_NEW_ENTRIES_PER_DAY).
-  - **Exposure Bounds**: Hard limits on gross dollar exposure (MAX_GROSS_EXPOSURE_USD) including queued orders.
-  - **Dry-Run Default**: Safe-by-default execution (DRY_RUN=true) to evaluate signals and test pipelines without risking capital.
-  - **Directional Safety**: Short-selling protection (ALLOW_SHORTING=false) ensuring sales are monitored or closed without unsolicited short exposure.
+  - **Account & Position Caps**: Configurable maximum open positions (`MAX_OPEN_POSITIONS`) and daily entry throttle (`MAX_NEW_ENTRIES_PER_DAY`).
+  - **Exposure Bounds**: Hard limits on gross dollar exposure (`MAX_GROSS_EXPOSURE_USD`) including queued orders.
+  - **Dry-Run Default**: Safe-by-default execution (`DRY_RUN=true`) to evaluate signals and test pipelines without risking capital.
+  - **Directional Safety**: Short-selling protection (`ALLOW_SHORTING=false`) ensuring sales are monitored or closed without unsolicited short exposure.
 - **Deterministic Execution & Position Lifecycle**:
   - Automatically calculates position size based on target CZK/USD capital allocation.
   - Tracks fills with deterministic client order IDs to prevent duplicate executions.
   - Built-in position lifecycle manager handling take-profit, stop-loss, and maximum holding period exits.
 - **ACID SQLite Persistence**:
   - Stores all signals, queued orders, executions, fills, exits, and historical performance metrics.
-  - Automatic in-place database migrations and backward compatibility exports (	rade_history.csv, seen_insider_trades.log).
+  - Automatic in-place database migrations and backward compatibility exports (`trade_history.csv`, `seen_insider_trades.log`).
 - **Live Web Control Room & Telemetry**:
-  - **Control Dashboard (/)**: Real-time view of market status, active positions, 24-hour signal funnel, queue state, and historical win-rate leaderboard.
+  - **Control Dashboard (`/`)**: Real-time view of market status, active positions, 24-hour signal funnel, queue state, and historical win-rate leaderboard.
   - **Benchmark Tracking**: Live comparison of account equity return against buy-and-hold SPY (S&P 500).
-  - **Prometheus Metrics (/metrics)**: Production-ready metrics for scraping health, order latency, queue depth, and position count.
-  - **Health & Readiness Endpoints (/healthz, /readyz)**: Container liveness probes verifying broker connectivity and SQLite integrity.
+  - **Prometheus Metrics (`/metrics`)**: Production-ready metrics for scraping health, order latency, queue depth, and position count.
+  - **Health & Readiness Endpoints (`/healthz`, `/readyz`)**: Container liveness probes verifying broker connectivity and SQLite integrity.
 - **Production Hardened**:
   - Dedicated non-root container execution (UID/GID 10001).
-  - Read-only root filesystem support with explicit state volume isolation (/data).
+  - Read-only root filesystem support with explicit state volume isolation (`/data`).
   - TrueNAS SCALE deployment template and compose generation script.
 
 ---
 
 ## 🖥️ Web Control Room
 
-The embedded web server runs on port 8080 (configurable via MONITORING_PORT):
+The embedded web server runs on port 8080 (configurable via `MONITORING_PORT`):
 
 | Endpoint | Auth Required | Description |
 |---|:---:|---|
-| / | Optional (MONITORING_TOKEN) | Responsive visual control dashboard with performance charts, active signals, and funnel analytics |
-| /status | Optional (MONITORING_TOKEN) | Complete operational state snapshot in structured JSON |
-| /metrics | Optional (MONITORING_TOKEN) | Prometheus text-format telemetry for Grafana / alert managers |
-| /healthz | No | Process liveness check for Docker / Kubernetes probes |
-| /readyz | No | Storage accessibility and broker clock readiness check |
+| `/` | Optional (`MONITORING_TOKEN`) | Responsive visual control dashboard with performance charts, active signals, and funnel analytics |
+| `/status` | Optional (`MONITORING_TOKEN`) | Complete operational state snapshot in structured JSON |
+| `/metrics` | Optional (`MONITORING_TOKEN`) | Prometheus text-format telemetry for Grafana / alert managers |
+| `/healthz` | No | Process liveness check for Docker / Kubernetes probes |
+| `/readyz` | No | Storage accessibility and broker clock readiness check |
 
 ---
 
@@ -99,7 +99,7 @@ The embedded web server runs on port 8080 (configurable via MONITORING_PORT):
 
 ### 1. Local Setup
 
-`ash
+```bash
 # Clone repository
 git clone https://github.com/Natex-corporation/insider-trading.git
 cd insider-trading
@@ -116,34 +116,34 @@ pip install -r requirements.txt
 
 # Configure environment variables
 cp .env.example .env
-`
+```
 
-Edit .env and provide your Alpaca credentials:
+Edit `.env` and provide your Alpaca credentials:
 
-`env
+```env
 ALPACA_API_KEY=your_alpaca_paper_key
 ALPACA_SECRET_KEY=your_alpaca_paper_secret
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
 DRY_RUN=true
-`
+```
 
 Run the application:
 
-`ash
+```bash
 # Verify broker connectivity (read-only test)
 python alpaca.py
 
 # Launch service
 python main.py
-`
+```
 
-Visit http://localhost:8080 to access the control dashboard.
+Visit `http://localhost:8080` to access the control dashboard.
 
 ---
 
 ### 2. Docker Setup
 
-`ash
+```bash
 # Prepare data directory
 mkdir -p data
 
@@ -152,7 +152,7 @@ docker compose up -d --build
 
 # View real-time logs
 docker compose logs -f
-`
+```
 
 ---
 
@@ -161,42 +161,42 @@ docker compose logs -f
 Insider Edge includes dedicated automation for TrueNAS SCALE custom apps:
 
 1. Generate the tailored TrueNAS compose file:
-   `ash
+   ```bash
    export ALPACA_API_KEY="your-paper-key"
    export ALPACA_SECRET_KEY="your-paper-secret"
    export TRUENAS_DATASET_PATH="/mnt/pool/apps/insider-trading"
    python scripts/render_truenas_compose.py
-   `
-2. Paste the generated 	ruenas-compose.generated.yaml into **TrueNAS > Apps > Install via YAML**.
+   ```
+2. Paste the generated `truenas-compose.generated.yaml` into **TrueNAS > Apps > Install via YAML**.
 3. See [TRUENAS_DEPLOY.md](TRUENAS_DEPLOY.md) for step-by-step permissions and storage configuration.
 
 ---
 
 ## ⚙️ Configuration Reference
 
-All settings can be configured via environment variables or .env:
+All settings can be configured via environment variables or `.env`:
 
 | Variable | Default | Description |
 |---|:---:|---|
-| ALPACA_API_KEY | *required* | Alpaca API Key ID |
-| ALPACA_SECRET_KEY | *required* | Alpaca Secret Key |
-| ALPACA_BASE_URL | https://paper-api.alpaca.markets | Alpaca REST API endpoint |
-| DRY_RUN | 	rue | When true, evaluates signals without submitting broker orders |
-| ALLOW_SHORTING | alse | Permit eligible insider sales to initiate short positions |
-| ALLOW_LIVE_TRADING | alse | Explicit opt-in safety guard to allow live endpoints |
-| TRADE_CAPITAL_CZK | 250 | Target capital allocation per entry (converted via live FX) |
-| TAKE_PROFIT_PERCENT | 10 | Automatic take-profit target above entry price (%) |
-| STOP_LOSS_PERCENT | 7 | Automatic stop-loss limit below entry price (%) |
-| MAX_HOLD_DAYS | 30 | Maximum position holding duration (days) |
-| SIGNAL_MAX_AGE_HOURS | 36 | Maximum age of Finviz insider filings accepted |
-| FINVIZ_MAX_PAGES | 3 | Maximum pages scanned per scraping cycle |
-| MAX_OPEN_POSITIONS | 10 | Maximum concurrent positions (  for unlimited) |
-| MAX_NEW_ENTRIES_PER_DAY | 10 | Maximum new trade entries per New York market day |
-| MAX_GROSS_EXPOSURE_USD | 2500 | Hard cap on total portfolio gross market value |
-| BENCHMARK_SYMBOL | SPY | Benchmark symbol for equity alpha tracking |
-| STATE_DIR | /data | Directory for persistent SQLite database and logs |
-| MONITORING_PORT | 8080 | Port for the web control dashboard and metrics server |
-| MONITORING_TOKEN | *empty* | Optional bearer token to secure dashboard & telemetry |
+| `ALPACA_API_KEY` | *required* | Alpaca API Key ID |
+| `ALPACA_SECRET_KEY` | *required* | Alpaca Secret Key |
+| `ALPACA_BASE_URL` | `https://paper-api.alpaca.markets` | Alpaca REST API endpoint |
+| `DRY_RUN` | `true` | When true, evaluates signals without submitting broker orders |
+| `ALLOW_SHORTING` | `false` | Permit eligible insider sales to initiate short positions |
+| `ALLOW_LIVE_TRADING` | `false` | Explicit opt-in safety guard to allow live endpoints |
+| `TRADE_CAPITAL_CZK` | `250` | Target capital allocation per entry (converted via live FX) |
+| `TAKE_PROFIT_PERCENT` | `10` | Automatic take-profit target above entry price (%) |
+| `STOP_LOSS_PERCENT` | `7` | Automatic stop-loss limit below entry price (%) |
+| `MAX_HOLD_DAYS` | `30` | Maximum position holding duration (days) |
+| `SIGNAL_MAX_AGE_HOURS` | `36` | Maximum age of Finviz insider filings accepted |
+| `FINVIZ_MAX_PAGES` | `3` | Maximum pages scanned per scraping cycle |
+| `MAX_OPEN_POSITIONS` | `10` | Maximum concurrent positions (`0` for unlimited) |
+| `MAX_NEW_ENTRIES_PER_DAY` | `10` | Maximum new trade entries per New York market day |
+| `MAX_GROSS_EXPOSURE_USD` | `2500` | Hard cap on total portfolio gross market value |
+| `BENCHMARK_SYMBOL` | `SPY` | Benchmark symbol for equity alpha tracking |
+| `STATE_DIR` | `/data` | Directory for persistent SQLite database and logs |
+| `MONITORING_PORT` | `8080` | Port for the web control dashboard and metrics server |
+| `MONITORING_TOKEN` | *empty* | Optional bearer token to secure dashboard & telemetry |
 
 ---
 
@@ -204,7 +204,7 @@ All settings can be configured via environment variables or .env:
 
 The codebase includes a comprehensive unit test suite covering configuration validation, signal screening, risk checks, queue retry backoffs, and SQLite persistence.
 
-`ash
+```bash
 # Install development dependencies
 pip install -r requirements-dev.txt
 
@@ -213,15 +213,15 @@ ruff check .
 
 # Execute test suite
 pytest
-`
+```
 
 ---
 
 ## 📊 Portfolio & Engineering Highlights
 
 - **Resilient Polling & Backoff**: Handles market closures, weekends, broker outages, and rate limits with dynamic loop intervals and exponential backoff retry queues.
-- **Zero Drift State Machine**: SQLite ACID state tracks each order across pending_new -> filled -> open_position -> exit_triggered -> closed, ensuring consistent state even across container restarts.
-- **Strict Least-Privilege Security**: Runs as an unprivileged user (insider, UID 10001) in a read-only container root environment with secrets isolated to environment variables.
+- **Zero Drift State Machine**: SQLite ACID state tracks each order across `pending_new` &rarr; `filled` &rarr; `open_position` &rarr; `exit_triggered` &rarr; `closed`, ensuring consistent state even across container restarts.
+- **Strict Least-Privilege Security**: Runs as an unprivileged user (`insider`, UID 10001) in a read-only container root environment with secrets isolated to environment variables.
 - **Regulatory & Broker Compliance**: Complies with FINRA margin standards and modern Alpaca API specifications.
 
 ---
